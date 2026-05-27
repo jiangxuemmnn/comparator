@@ -1,0 +1,51 @@
+# 订单处理场景 - 模拟电商下单流程
+name: "order_flow_workload"
+description: "模拟电商下单、支付、发货流程"
+
+tables:
+  - name: orders
+    ddl: |
+      CREATE TABLE IF NOT EXISTS {schema}.orders (
+          id SERIAL PRIMARY KEY,
+          order_no VARCHAR(32) NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL,
+          amount NUMERIC(18,2),
+          status VARCHAR(16) DEFAULT 'pending',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+
+concurrency: 20
+duration: 300
+
+seed:
+  - |
+    INSERT INTO {schema}.orders (order_no, user_id, amount, status)
+    SELECT 'ORD' || g, (g % 50) + 1, (random() * 1000)::numeric(18,2), 'pending'
+    FROM generate_series(1, 1000) AS g
+    ON CONFLICT (order_no) DO NOTHING
+
+transactions:
+  - name: "create_order"
+    weight: 5
+    sql: |
+      INSERT INTO {schema}.orders (order_no, user_id, amount, status)
+      VALUES ('ORD%(random_str:16)s', %(random_int:1-50)s, %(random_float:1.00-9999.00)s, 'pending')
+
+  - name: "pay_order"
+    weight: 3
+    sql: |
+      UPDATE {schema}.orders SET status = 'paid', updated_at = %(timestamp)s
+      WHERE id = (SELECT id FROM {schema}.orders WHERE status = 'pending' ORDER BY random() LIMIT 1)
+
+  - name: "ship_order"
+    weight: 2
+    sql: |
+      UPDATE {schema}.orders SET status = 'shipped', updated_at = %(timestamp)s
+      WHERE id = (SELECT id FROM {schema}.orders WHERE status = 'paid' ORDER BY random() LIMIT 1)
+
+  - name: "cancel_order"
+    weight: 1
+    sql: |
+      UPDATE {schema}.orders SET status = 'cancelled', updated_at = %(timestamp)s
+      WHERE id = (SELECT id FROM {schema}.orders WHERE status = 'pending' ORDER BY random() LIMIT 1)

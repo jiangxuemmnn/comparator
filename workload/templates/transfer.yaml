@@ -1,0 +1,41 @@
+# 金融转账场景 - 模拟银行转账业务
+name: "transfer_workload"
+description: "模拟金融账户间转账场景，用于高可用切换时的一致性校验"
+
+tables:
+  - name: accounts
+    ddl: |
+      CREATE TABLE IF NOT EXISTS {schema}.accounts (
+          id SERIAL PRIMARY KEY,
+          account_no VARCHAR(32) NOT NULL UNIQUE,
+          balance NUMERIC(18,2) DEFAULT 0.00,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+
+concurrency: 10
+duration: 300
+throttle_ms: 0
+
+seed:
+  - |
+    INSERT INTO {schema}.accounts (account_no, balance)
+    SELECT 'ACC' || generate_series, 10000.00
+    FROM generate_series(1, 100)
+    ON CONFLICT (account_no) DO NOTHING
+
+transactions:
+  - name: "transfer"
+    weight: 10
+    sql: |
+      UPDATE {schema}.accounts SET balance = balance - %(random_float:0.01-1000.00)s, updated_at = %(timestamp)s WHERE id = %(random_int:1-100)s;
+      UPDATE {schema}.accounts SET balance = balance + %(random_float:0.01-1000.00)s, updated_at = %(timestamp)s WHERE id = %(random_int:1-100)s
+
+  - name: "deposit"
+    weight: 3
+    sql: |
+      UPDATE {schema}.accounts SET balance = balance + %(random_float:0.01-5000.00)s, updated_at = %(timestamp)s WHERE id = %(random_int:1-100)s
+
+  - name: "withdraw"
+    weight: 2
+    sql: |
+      UPDATE {schema}.accounts SET balance = balance - %(random_float:0.01-500.00)s, updated_at = %(timestamp)s WHERE id = %(random_int:1-100)s AND balance >= %(random_float:0.01-500.00)s
