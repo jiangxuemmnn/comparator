@@ -27,20 +27,20 @@ databases:
 
   # ---- 节点1（示例：主节点）----
   node1:
-    host: 192.168.1.101           # 数据库服务器 IP 或主机名
-    port: 54321                   # Kingbase 默认 54321，PostgreSQL 默认 5432
-    dbname: testdb                # 数据库名
+    host: 10.217.0.106           # 数据库服务器 IP 或主机名
+    port: 53261                   # Kingbase 默认 54321，PostgreSQL 默认 5432
+    dbname: kingbase                # 数据库名
     user: system                  # 用户名
-    password: "your_password"     # 密码（特殊字符请用引号括起来）
+    password: "12345678ab"     # 密码（特殊字符请用引号括起来）
     connect_timeout: 10           # 连接超时秒数
 
   # ---- 节点2（示例：备节点）----
   node2:
-    host: 192.168.1.102
-    port: 54321
-    dbname: testdb
+    host: 10.217.0.105
+    port: 53261
+    dbname: kingbase
     user: system
-    password: "your_password"
+    password: "12345678ab"
     connect_timeout: 10
 
   # ---- 更多节点按需添加 ----

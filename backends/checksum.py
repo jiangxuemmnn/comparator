@@ -26,16 +26,17 @@ def _build_chunk_query(schema: str, table: str, pk_cols: list[str],
 
     concat = " || '|' || ".join(col_exprs)
     pk_order = ", ".join(_quote_ident(c) for c in pk_cols)
+    pk_select = ", ".join(_quote_ident(c) for c in pk_cols)
 
     return (
         "SELECT MD5(string_agg(row_hash, '' ORDER BY %s)) "
         "FROM ("
-        "  SELECT MD5(%s) AS row_hash "
+        "  SELECT MD5(%s) AS row_hash, %s "
         "  FROM %s.%s "
         "  ORDER BY %s "
         "  OFFSET %d LIMIT %d"
         ") AS chunk"
-    ) % (pk_order, concat, _quote_ident(schema), _quote_ident(table),
+    ) % (pk_order, concat, pk_select, _quote_ident(schema), _quote_ident(table),
          pk_order, start, size)
 
 
