@@ -47,8 +47,11 @@ class DatabasePool:
 
     def execute(self, name: str, sql: str, params=None, fetch: bool = True):
         """Execute SQL on a named node and optionally return results."""
-        with self.cursor(name) as cur:
-            cur.execute(sql, params)
+        with self.cursor(name, autocommit=not fetch) as cur:
+            if params and isinstance(params, list) and len(params) > 0 and isinstance(params[0], (list, tuple)):
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
             if fetch:
                 return cur.fetchall()
             return None
