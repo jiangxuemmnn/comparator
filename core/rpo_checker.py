@@ -27,6 +27,10 @@ from utils.db import DatabasePool
 
 logger = logging.getLogger("comparator.rpo")
 
+
+def _quote_ident(name: str) -> str:
+    return '"%s"' % name.replace('"', '""')
+
 CREATE_MARKER_TABLE = """
 CREATE TABLE IF NOT EXISTS {schema}._rpo_markers (
     id SERIAL PRIMARY KEY,
@@ -116,7 +120,8 @@ class RPOChecker:
                 try:
                     rows = self.pool.execute(
                         self.node,
-                        "SELECT MAX(%s) FROM %s.%s" % (pk, self.schema, table),
+                        "SELECT MAX(%s) FROM %s.%s" % (
+                            _quote_ident(pk), _quote_ident(self.schema), _quote_ident(table)),
                     )
                     max_id = rows[0][0] if rows else None
                 except Exception:
@@ -289,7 +294,8 @@ class RPOChecker:
             # Check current max
             rows = self.pool.execute(
                 self.node,
-                "SELECT MAX(%s) FROM %s.%s" % (pk, self.schema, table),
+                "SELECT MAX(%s) FROM %s.%s" % (
+                    _quote_ident(pk), _quote_ident(self.schema), _quote_ident(table)),
             )
             new_max = rows[0][0] if rows else None
 
@@ -302,13 +308,16 @@ class RPOChecker:
             # Only check integer-type PKs
             if any(t in col_type for t in ("int", "serial", "numeric")):
                 # Use generate_series to find gaps
+                q_pk = _quote_ident(pk)
+                q_schema = _quote_ident(self.schema)
+                q_table = _quote_ident(table)
                 gap_sql = (
                     "SELECT s.i AS missing_id FROM generate_series(1, "
                     "(SELECT MAX(%s) FROM %s.%s)) AS s(i) "
                     "LEFT JOIN %s.%s t ON t.%s = s.i "
                     "WHERE t.%s IS NULL AND s.i <= %%s "
                     "ORDER BY s.i LIMIT 100"
-                ) % (pk, self.schema, table, self.schema, table, pk, pk)
+                ) % (q_pk, q_schema, q_table, q_schema, q_table, q_pk, q_pk)
 
                 gaps = self.pool.execute(self.node, gap_sql, (old_max,))
 

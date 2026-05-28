@@ -112,7 +112,7 @@ class WorkloadRunner:
         sql = self._interpolate_sql(sql_template)
 
         try:
-            with self.pool.cursor(conn_name) as cur:
+            with self.pool.cursor(conn_name, autocommit=True) as cur:
                 # Split by semicolon for multi-statement
                 statements = [s.strip() for s in sql.split(";") if s.strip()]
                 for stmt in statements:

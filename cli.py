@@ -398,7 +398,12 @@ def cmd_schedule(args, config, pool):
             full_argv.extend(sub_args)
 
             parsed = parser.parse_args(full_argv)
-            exit_code = parsed.func(parsed, config, pool)
+            cmd_map = _build_cmd_map()
+            cmd_func = cmd_map.get(parsed.command.replace("-", "_"))
+            if not cmd_func:
+                logger.error("Scheduled run #%d: unknown command '%s'", iteration, parsed.command)
+                continue
+            exit_code = cmd_func(parsed, config, pool)
             logger.info("Scheduled run #%d completed (exit=%d)", iteration, exit_code)
         except SystemExit:
             logger.warning("Scheduled run #%d: subcommand parser exited", iteration)

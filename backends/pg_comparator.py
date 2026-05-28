@@ -80,6 +80,7 @@ def run_pg_comparator(config: dict, node_a: str, node_b: str,
     )
 
     # Write temp config
+    cfg_path = None
     fd, cfg_path = tempfile.mkstemp(suffix=".yml", prefix="pgcmp_")
     try:
         with os.fdopen(fd, "w") as f:
@@ -119,5 +120,5 @@ def run_pg_comparator(config: dict, node_a: str, node_b: str,
             "diff_count": -1,
         }
     finally:
-        if os.path.exists(cfg_path):
+        if cfg_path and os.path.exists(cfg_path):
             os.unlink(cfg_path)

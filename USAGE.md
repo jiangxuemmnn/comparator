@@ -13,8 +13,15 @@
 本工具内置 `checksum` 和 `native` 两种对比引擎，覆盖日常所有场景。**内部对比引擎不需要安装任何外部工具**。
 
 ```bash
-# 1. 在有网络的机器上下载依赖包
-pip download -d ./offline_pkgs -r requirements.txt
+# 1. 在有网络的机器上下载依赖包（注意：需要指定内网机器的平台和 Python 版本）
+#    例如内网机器是 Linux x86_64 + Python 3.8：
+pip download -d ./offline_pkgs -r requirements.txt \
+    --platform manylinux2014_x86_64 \
+    --python-version 38 \
+    --only-binary=:all:
+
+# 若不确定平台，可直接在内网机器上执行以下命令查看：
+#   python -c "import sysconfig; print(sysconfig.get_platform())"
 
 # 2. 将整个 comparator 目录 + offline_pkgs 拷到内网机器
 
@@ -45,12 +52,12 @@ python cli.py -c config.yaml list-backends
 
 ```bash
 python cli.py init-config
-# 生成 config.yaml
+# 从 config.yaml.example 模板生成 config.yaml
 ```
 
 ### 2. 编辑配置
 
-编辑 `config.yaml`，至少填写数据库连接信息（详见配置文件内的注释）：
+编辑 `config.yaml`（可从 `config.yaml.example` 模板复制），至少填写数据库连接信息：
 
 ```yaml
 databases:
@@ -334,7 +341,8 @@ python cli.py -c config.yaml gen-data -n <节点> [--accounts N] [--orders N] [-
 | `--products` | products 表行数（默认 200） |
 | `--orders` | orders 表行数（默认 5000） |
 | `--transactions` | transactions 表行数（默认 10000） |
-| `--teardown` | 清理模式 |
+| `--truncate` | 生成前先清空已有测试表数据 |
+| `--teardown` | 清理模式（删除所有测试表） |
 
 ---
 

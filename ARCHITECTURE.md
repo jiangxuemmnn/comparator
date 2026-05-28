@@ -86,7 +86,7 @@
 ```
 
 - 将表按主键范围分成 `chunk_size` 大小的块
-- 每块计算 `MD5(string_agg(MD5(row), ORDER BY pk))`
+- 每块计算 `MD5(string_agg(MD5(row), ORDER BY pk))`，内层子查询同时输出行哈希和主键列
 - 对比两个节点的块 checksum
 - **优点**：速度快，适合大表；**缺点**：只知道哪块不一致，不知具体行
 
@@ -111,16 +111,15 @@ SELECT * FROM node_a.accounts;
 
 ```
 ┌─────────────────────────────────────────────────┐
-│              workload/templates/                 │
+│              workload/generator.py               │
 │                                                  │
-│  transfer.yaml   order_flow.yaml   自定义.yaml    │
-│  (金融转账)       (电商订单)         (用户定义)     │
-└────────┬──────────────────────────────┬──────────┘
-         │                              │
-         ▼                              ▼
-┌─────────────────────────────────────────────────┐
-│               runner.py                          │
+│  DataGenerator: 测试数据生成器                     │
+│  ├── create_all_tables()  建表（4张预定义表）      │
+│  ├── populate_*()         按批次插入数据            │
+│  ├── truncate_all()       清空表数据（CASCADE）    │
+│  └── teardown()           删除所有表               │
 │                                                  │
+│  workload/runner.py                              │
 │  YAML解析 → 建表 → 种子数据 → 多线程并发执行       │
 │                                                  │
 │  Worker-1  Worker-2  ...  Worker-N              │
@@ -148,9 +147,11 @@ YAML 模板支持的随机占位符：
 
 | 模块 | 职责 |
 |------|------|
-| `db.py` | 连接池管理，支持多节点连接复用；提供游标、主键查询、行数统计等辅助方法 |
-| `config.py` | YAML 配置加载，合并默认值，校验必填字段 |
+| `db.py` | 连接池管理，支持多节点连接复用；提供游标、主键查询、行数统计等辅助方法。`execute()` 自动判断单条/批量参数（`execute` vs `executemany`），写操作自动提交 |
+| `config.py` | YAML 配置加载，合并默认值，校验必填字段。`generate_template()` 从 `config.yaml.example` 模板生成配置文件 |
 | `logger.py` | 统一的日志格式，支持控制台+文件双输出 |
+
+**Python 3.8 兼容性：** 所有使用 PEP 585 类型标注（如 `list[str]`）的模块均添加了 `from __future__ import annotations`，确保在 Python 3.8 上可正常运行。
 
 ---
 

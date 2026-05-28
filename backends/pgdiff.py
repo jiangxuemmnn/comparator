@@ -18,6 +18,9 @@ def _dump_schema(pool, name: str, schema: str, output_path: str):
     """Dump schema via pg_dump to file."""
     conn = pool.get_conn(name)
     dsn = conn.get_dsn_parameters()
+    # psycopg2's get_dsn_parameters() does not include the password;
+    # pull it from the original config so pg_dump can authenticate.
+    dbcfg = pool._config["databases"].get(name, {})
     cmd = [
         "pg_dump",
         "-h", dsn.get("host", "localhost"),
@@ -29,7 +32,7 @@ def _dump_schema(pool, name: str, schema: str, output_path: str):
         "-f", output_path,
     ]
     env = os.environ.copy()
-    env["PGPASSWORD"] = dsn.get("password", "")
+    env["PGPASSWORD"] = dbcfg.get("password", "")
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
     if result.returncode != 0:
         raise RuntimeError("pg_dump schema failed: %s" % result.stderr)
