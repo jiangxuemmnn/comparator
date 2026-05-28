@@ -205,6 +205,18 @@ class DataGenerator:
             )
             logger.debug("Transactions: %d/%d", batch_end, count)
 
+    def truncate_all(self):
+        """Truncate all generated tables before re-populating."""
+        for name in TABLE_TEMPLATES:
+            try:
+                self.pool.execute_ddl(
+                    self.node,
+                    "TRUNCATE TABLE %s.%s CASCADE" % (self.schema, name),
+                )
+                logger.info("Truncated table %s.%s", self.schema, name)
+            except Exception as e:
+                logger.debug("Skip truncate %s: %s", name, e)
+
     def generate_all(self, accounts: int = 1000, products: int = 200,
                      orders: int = 5000, transactions: int = 10000):
         """Generate all test tables and populate with data."""

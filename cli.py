@@ -297,6 +297,9 @@ def cmd_gen_data(args, config, pool):
         logger.info("Test data tables dropped")
         return 0
 
+    if args.truncate:
+        gen.truncate_all()
+
     gen.generate_all(
         accounts=args.accounts,
         products=args.products,
@@ -556,6 +559,7 @@ Examples:
     p_gd.add_argument("--orders", type=int, default=5000)
     p_gd.add_argument("--transactions", type=int, default=10000)
     p_gd.add_argument("--teardown", action="store_true", help="Drop generated tables")
+    p_gd.add_argument("--truncate", action="store_true", help="Truncate tables before generating")
 
     # run-workload
     p_rw = sub.add_parser("run-workload", help="Run custom workload from YAML file")
