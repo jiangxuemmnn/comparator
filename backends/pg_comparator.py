@@ -6,6 +6,8 @@ Supports PostgreSQL / Kingbase.
 Requires pg_comparator to be installed on the system.
 """
 
+from __future__ import annotations
+
 import logging
 import subprocess
 import tempfile

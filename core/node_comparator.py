@@ -5,6 +5,8 @@ Supports: checksum (fast, chunked), native (EXCEPT queries),
 pg_comparator (external), data-diff (external).
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed

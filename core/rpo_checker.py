@@ -15,6 +15,8 @@ Typical workflow:
   rpo.check_sequence_gaps()    # Look for gaps in sequential columns
 """
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid

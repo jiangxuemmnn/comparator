@@ -4,6 +4,8 @@ Splits tables into chunks by primary key ranges, computes MD5 checksum
 for each chunk, and compares across database nodes.
 """
 
+from __future__ import annotations
+
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed

@@ -14,6 +14,8 @@ Two integration modes:
      - Call tracker.verify_all() to check
 """
 
+from __future__ import annotations
+
 import logging
 import json
 import uuid

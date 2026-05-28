@@ -20,6 +20,8 @@ transactions:
 rollback_on_error: false
 """
 
+from __future__ import annotations
+
 import logging
 import time
 import random

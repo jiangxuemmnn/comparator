@@ -4,6 +4,8 @@ Uses EXCEPT/MINUS and FULL OUTER JOIN to find rows present in one node
 but not the other, or rows where column values differ.
 """
 
+from __future__ import annotations
+
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 

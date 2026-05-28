@@ -6,6 +6,8 @@ Cross-database data comparison tool supporting PostgreSQL and others.
 Requires data-diff to be installed (pip install data-diff).
 """
 
+from __future__ import annotations
+
 import logging
 import subprocess
 
