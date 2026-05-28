@@ -73,7 +73,7 @@ def generate_template(path: str):
     Copies from the bundled template file (config.yaml in project root).
     """
     import os as _os
-    _template = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "config.yaml")
+    _template = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "config.yaml.example")
     if _os.path.exists(_template):
         with open(_template, "r", encoding="utf-8") as src:
             content = src.read()
