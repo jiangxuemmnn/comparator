@@ -518,6 +518,13 @@ python cli.py -c config.yaml schedule --interval 60 --rounds 10 -- \
 
 以上参数在子命令**前后都可以写**：`cli.py -c cfg node-compare ... -f json` 与 `cli.py -c cfg -f json node-compare ...` 等价。
 
+**输出流约定**：日志走 **stderr**，命令结果（表格或 JSON）走 **stdout**。因此
+`-f json` 的输出可以直接接到 `jq` 等工具：
+
+```bash
+python cli.py -c config.yaml node-compare --nodes node1,node2,node3 -f json | jq .conclusion
+```
+
 ### node-compare
 
 | 选项 | 说明 |
@@ -685,7 +692,12 @@ A：说明校验期间业务还在写入。若需要确定性结论，请在业�
 A：`DIVERGENT` 是"确认不一致"（退出码 1）；`INCONCLUSIVE` 是"没能得出结论"（退出码 2），通常因为某节点读不到，或差异块无法定位多数派。自动化脚本中这两者应当分流处理。
 
 **Q：定时巡检的日志和报告在哪？**
-A：日志默认在 `./logs/comparator.log`；报告默认在 `./reports/`，含每轮的 `round_*.json` 与汇总 `summary.json`。
+A：日志默认在 `./logs/comparator.log`，同时输出到终端（stderr）；报告默认在
+`./reports/`，含每轮的 `round_*.json` 与汇总 `summary.json`。
+
+**Q：把输出重定向到文件后看不到日志了？**
+A：这是有意为之。日志走 stderr、结果走 stdout，所以 `> out.json` 只会写结果，
+日志仍显示在终端。两者都要留时用 `> out.json 2> run.log`。
 
 **Q：大表对比很慢怎么办？**
 A：用 `checksum` 引擎（默认），它按主键区间分块。可调大 `comparison.chunk_size`（减少块数）和 `parallel`（提高并发）。分块边界由主键值决定，因此两侧行数不同也不会错位。
