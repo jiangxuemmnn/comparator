@@ -1,18 +1,16 @@
 """RPO (Recovery Point Objective) data loss detection.
 
 Detects data loss in fault/failover scenarios by:
-1. Inserting marker records before a fault event
-2. After recovery, verifying those markers exist
-3. Comparing row counts before and after the event
-4. Checking for gaps in sequential data (e.g., missing serial IDs)
+1. Snapshotting per-table row counts and maximum keys before a fault
+2. Planting marker rows that ride the same replication stream
+3. After recovery, verifying the markers still exist
+4. Comparing row counts and maximum keys against the snapshots
 
 Typical workflow:
   rpo = RPOChecker(pool, "node1")
-  rpo.plant_markers()          # Plant markers before fault
+  rpo.plant_markers()          # Snapshot state + plant markers, before fault
   # --- User triggers fault/failover ---
-  rpo.check_markers()          # After recovery, verify markers
-  rpo.check_row_counts()       # Compare counts
-  rpo.check_sequence_gaps()    # Look for gaps in sequential columns
+  rpo.check_all(batch_id)      # After recovery: markers + conservation
 """
 
 from __future__ import annotations
@@ -24,8 +22,15 @@ import json
 from datetime import datetime
 
 from utils.db import DatabasePool
+from utils.scope import build_matcher
 
 logger = logging.getLogger("comparator.rpo")
+
+# Tables the tool itself owns. They grow while a check runs -- _rpo_snapshots
+# gains a row per table, _rpo_markers gains one per marker -- so snapshotting
+# them would report a made-up delta and bury the real signal. Excluded
+# unconditionally, independent of configuration.
+TOOL_TABLES = ("_rpo_markers", "_rpo_snapshots", "_app_db_tracking")
 
 
 def _quote_ident(name: str) -> str:
@@ -71,11 +76,22 @@ class RPOChecker:
         print(results)
     """
 
-    def __init__(self, pool: DatabasePool, node: str, schema: str = "public"):
+    def __init__(self, pool: DatabasePool, node: str, schema: str = "public",
+                 config: dict = None):
         self.pool = pool
         self.node = node
         self.schema = schema
+        self.matcher = build_matcher(config or {}, node=node) if config is not None else None
         self._ensure_tables()
+
+    def _select_tables(self, tables):
+        """Resolve the table list to snapshot, honouring scope and tool tables."""
+        if tables is None:
+            tables = self.pool.get_tables(self.node, self.schema)
+            if self.matcher is not None:
+                dbname = self.pool.get_database_name(self.node)
+                tables = self.matcher.filter_tables(dbname, self.schema, tables)
+        return [t for t in tables if t not in TOOL_TABLES]
 
     def _ensure_tables(self):
         """Create RPO tracking tables if not exist."""
@@ -83,287 +99,251 @@ class RPOChecker:
         pool.execute_ddl(self.node, CREATE_MARKER_TABLE.format(schema=self.schema))
         pool.execute_ddl(self.node, CREATE_SNAPSHOT_TABLE.format(schema=self.schema))
 
-    def plant_markers(self, tables: list[str] = None,
+    def plant_markers(self, tables: list = None,
                       marker_count: int = 10) -> str:
-        """Plant marker records before a fault event.
+        """Record the pre-fault state and plant markers. Returns batch_id.
 
-        Records row counts and inserts visible markers on the target node.
+        Two separate things are captured, and it matters which is which:
 
-        Args:
-            tables: Tables to snapshot (None = all user tables)
-            marker_count: Number of marker rows to insert per table
+        * Per-table snapshots (row count + maximum key). These are what
+          attribute any loss to a specific business table.
 
-        Returns:
-            batch_id for later verification
+        * A handful of marker rows, appended to _rpo_markers. The marker
+          INSERT travels the same replication stream as business writes, so
+          whether the last markers survived says whether the stream itself
+          carried the final writes before the fault. They are NOT written
+          into the business tables -- doing so would pollute the data under
+          test and collide with NOT NULL / FK constraints -- so a missing
+          marker is evidence about replication, not about any particular
+          business table. The previous version stamped each marker with a
+          business table name it never actually touched, which made the
+          report attribute loss to the wrong place.
         """
         batch_id = uuid.uuid4().hex[:16]
-
-        if tables is None:
-            tables = self.pool.get_tables(self.node, self.schema)
+        tables = self._select_tables(tables)
 
         for table in tables:
-            # Snapshot row count
             count = self.pool.get_row_count(self.node, self.schema, table)
-            self.pool.execute(
-                self.node,
-                "INSERT INTO %s._rpo_snapshots (batch_id, table_name, row_count) "
-                "VALUES (%%s, %%s, %%s)" % self.schema,
-                (batch_id, table, count),
-                fetch=False,
-            )
 
-            # Try to get max ID for sequential gap detection
-            pk_cols = self.pool.get_primary_key(self.node, self.schema, table)
             max_id = None
+            pk_cols = self.pool.get_primary_key(self.node, self.schema, table)
             if pk_cols and len(pk_cols) == 1:
-                pk = pk_cols[0]
                 try:
                     rows = self.pool.execute(
                         self.node,
                         "SELECT MAX(%s) FROM %s.%s" % (
-                            _quote_ident(pk), _quote_ident(self.schema), _quote_ident(table)),
+                            _quote_ident(pk_cols[0]),
+                            _quote_ident(self.schema),
+                            _quote_ident(table)),
                     )
                     max_id = rows[0][0] if rows else None
                 except Exception:
                     pass
 
-            # Update max_id in snapshot
-            if max_id is not None:
-                self.pool.execute(
-                    self.node,
-                    "UPDATE %s._rpo_snapshots SET max_id = %%s "
-                    "WHERE batch_id = %%s AND table_name = %%s" % self.schema,
-                    (max_id, batch_id, table),
-                    fetch=False,
-                )
+            self.pool.execute(
+                self.node,
+                "INSERT INTO %s._rpo_snapshots "
+                "(batch_id, table_name, row_count, max_id) "
+                "VALUES (%%s, %%s, %%s, %%s)" % self.schema,
+                (batch_id, table, count, max_id),
+                fetch=False,
+            )
 
-            # Insert marker rows
-            for i in range(marker_count):
-                marker_id = "%s_%s_%d" % (batch_id, table, i)
-                self.pool.execute(
-                    self.node,
-                    "INSERT INTO %s._rpo_markers "
-                    "(marker_id, batch_id, table_name, phase, extra) "
-                    "VALUES (%%s, %%s, %%s, 'before_fault', %%s)" % self.schema,
-                    (
-                        marker_id, batch_id, table,
-                        json.dumps({
-                            "seq": i,
-                            "timestamp": datetime.now().isoformat(),
-                        }),
-                    ),
-                    fetch=False,
-                )
+        # Markers are one batch-wide probe, not one per business table.
+        #
+        # Each marker records the batch's planted total, not just its own
+        # sequence number. Without that, a check can only compare the
+        # markers it finds against each other: deleting the last few would
+        # simply lower the count and the loss would go unreported.
+        now = datetime.now().isoformat()
+        self.pool.execute(
+            self.node,
+            "INSERT INTO %s._rpo_markers "
+            "(marker_id, batch_id, table_name, phase, extra) "
+            "SELECT %%s || '_' || g, %%s, '(replication-probe)', 'before_fault', "
+            "       json_build_object('seq', g, 'total', %%s, "
+            "                         'timestamp', %%s)::jsonb "
+            "FROM generate_series(1, %%s) g" % self.schema,
+            (batch_id, batch_id, marker_count, now, marker_count),
+            fetch=False,
+        )
 
-        logger.info("Planted %d markers per table, batch=%s on node '%s'",
-                    marker_count, batch_id, self.node)
+        logger.info("Planted %d replication-probe markers over %d tables, batch=%s on %s",
+                    marker_count, len(tables), batch_id, self.node)
         return batch_id
 
     def check_markers(self, batch_id: str) -> dict:
-        """Verify that markers planted before fault still exist after recovery.
+        """Check whether the markers planted before the fault survived.
 
-        Returns dict with: total, found, missing, missing_details.
+        A marker that is gone means writes committed on the primary just
+        before the fault never reached this node. Because the markers live
+        in one table, that verdict is about the replication stream as a
+        whole; per-table loss is reported by check_conservation instead.
         """
         markers = self.pool.execute(
             self.node,
-            "SELECT marker_id, table_name FROM %s._rpo_markers "
-            "WHERE batch_id = %%s AND phase = 'before_fault'" % self.schema,
+            "SELECT marker_id, extra FROM %s._rpo_markers "
+            "WHERE batch_id = %%s AND phase = 'before_fault' "
+            "ORDER BY marker_id" % self.schema,
             (batch_id,),
         )
 
-        total = len(markers)
-        found = 0
-        missing = []
-
+        # The denominator is the number PLANTED, read back from the markers
+        # that survived, not the number currently present. Taking it from
+        # the survivors would make every deletion shrink the total and no
+        # loss would ever be reported.
+        present = {}
+        planted_total = 0
         for m in markers:
-            table = m["table_name"]
-            marker_id = m["marker_id"]
+            extra = m["extra"]
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:
+                    extra = {}
+            extra = extra or {}
+            seq = extra.get("seq")
+            if seq is not None:
+                present[seq] = m["marker_id"]
+            planted_total = max(planted_total, extra.get("total") or 0)
+        if not planted_total:
+            # Legacy batch planted by an older version, or a batch whose
+            # markers all vanished. Fall back to the surviving count.
+            planted_total = len(present) or len(markers)
 
-            rows = self.pool.execute(
-                self.node,
-                "SELECT COUNT(*) FROM %s._rpo_markers "
-                "WHERE marker_id = %%s" % self.schema,
-                (marker_id,),
-            )
-            if rows and rows[0][0] > 0:
-                found += 1
-            else:
-                missing.append({
-                    "marker_id": marker_id,
-                    "table": table,
-                    "detail": "Marker lost after fault",
-                })
+        seqs = sorted(set(range(1, planted_total + 1)) - set(present))
+        missing = [{
+            "marker_id": "%s_%d" % (batch_id, s),
+            "seq": s,
+            "detail": "故障前写入的标记在恢复后不存在 —— 复制流未送达最后的写入",
+        } for s in seqs]
 
         logger.info("Marker check: %d/%d found, %d missing (batch=%s)",
-                    found, total, len(missing), batch_id)
+                    planted_total - len(missing), planted_total,
+                    len(missing), batch_id)
 
         return {
             "batch_id": batch_id,
-            "total": total,
-            "found": found,
+            "total": planted_total,
+            "found": planted_total - len(missing),
             "missing": len(missing),
             "missing_details": missing,
+            "missing_seqs": seqs,
             "success": len(missing) == 0,
+            "note": ("标记是整批次的复制流探针，不针对某张业务表；"
+                     "逐表丢失情况见 conservation 检查"),
         }
 
-    def check_row_counts(self, batch_id: str) -> dict:
-        """Compare current row counts with pre-fault snapshots.
+    def check_conservation(self, batch_id: str) -> dict:
+        """Detect loss by comparing row counts and maximum keys.
 
-        Returns dict with per-table before/after counts and diffs.
+        This replaces the previous generate_series-based gap scan, which had
+        two fatal flaws:
+
+          * it reported every normal DELETE as data loss, and every sequence
+            jump (nextval is not reclaimed on rollback) as data loss too, so
+            false positives were guaranteed on any live system;
+          * it materialised `generate_series(1, MAX(pk))` and left-joined it,
+            so a table whose keys start at 100 million would build a row per
+            integer in between before answering.
+
+        A row count that went down, or a maximum key that went backwards,
+        cannot happen through normal growth and is genuine evidence. Both
+        checks are O(1) or index-only.
+
+        One thing this deliberately does NOT do is distinguish "rows deleted
+        by the application" from "rows lost in the fault". Nothing available
+        server-side can tell those apart -- the only reliable discriminator
+        is an application-side record of what was written, which is what the
+        app-db tracking mode provides.
         """
         snapshots = self.pool.execute(
             self.node,
-            "SELECT table_name, row_count, max_id "
-            "FROM %s._rpo_snapshots "
-            "WHERE batch_id = %%s "
-            "ORDER BY table_name" % self.schema,
+            "SELECT table_name, row_count, max_id FROM %s._rpo_snapshots "
+            "WHERE batch_id = %%s ORDER BY table_name" % self.schema,
             (batch_id,),
         )
 
-        results = []
-        total_before = 0
-        total_after = 0
-        tables_with_loss = []
-
-        for snap in snapshots:
-            table = snap["table_name"]
-            before = snap["row_count"]
-            after = self.pool.get_row_count(self.node, self.schema, table)
-            delta = after - before
-
-            total_before += before
-            total_after += after
-
-            entry = {
-                "table": table,
-                "before_count": before,
-                "after_count": after,
-                "delta": delta,
-            }
-
-            if delta < 0:
-                tables_with_loss.append(table)
-                entry["status"] = "DATA_LOSS"
-                logger.warning("Table %s: %d rows lost (before=%d, after=%d)",
-                               table, -delta, before, after)
-            elif delta > 0:
-                entry["status"] = "DATA_GAIN"
-            else:
-                entry["status"] = "ok"
-
-            results.append(entry)
-
-        return {
-            "batch_id": batch_id,
-            "total_before": total_before,
-            "total_after": total_after,
-            "total_delta": total_after - total_before,
-            "tables_with_loss": tables_with_loss,
-            "tables_checked": len(results),
-            "success": len(tables_with_loss) == 0,
-            "details": results,
-        }
-
-    def check_sequence_gaps(self, batch_id: str,
-                            min_gap_size: int = 1) -> dict:
-        """Check for gaps in sequential PK columns after recovery.
-
-        Compares current MAX(id) against pre-fault max_id.
-        A gap indicates data was written before fault but missing after.
-        """
-        snapshots = self.pool.execute(
-            self.node,
-            "SELECT table_name, max_id FROM %s._rpo_snapshots "
-            "WHERE batch_id = %%s AND max_id IS NOT NULL" % self.schema,
-            (batch_id,),
-        )
-
-        gaps_found = []
+        losses = []
         results = []
 
         for snap in snapshots:
             table = snap["table_name"]
+            if table in TOOL_TABLES:
+                # A batch planted by an older version may have snapshotted
+                # the tool's own tables; skipping them keeps their growth
+                # out of the report.
+                continue
+            old_count = snap["row_count"]
             old_max = snap["max_id"]
 
-            pk_cols = self.pool.get_primary_key(self.node, self.schema, table)
-            if not pk_cols or len(pk_cols) != 1:
+            try:
+                new_count = self.pool.get_row_count(self.node, self.schema, table)
+            except Exception as e:
+                results.append({"table": table, "error": str(e),
+                                "status": "UNKNOWN"})
                 continue
-
-            pk = pk_cols[0]
-
-            # Check current max
-            rows = self.pool.execute(
-                self.node,
-                "SELECT MAX(%s) FROM %s.%s" % (
-                    _quote_ident(pk), _quote_ident(self.schema), _quote_ident(table)),
-            )
-            new_max = rows[0][0] if rows else None
-
-            # Check for missing IDs between old_min and old_max
-            # This detects: rows inserted before fault, committed, but lost after
-            cols_info = self.pool.get_column_info(self.node, self.schema, table)
-            col_types = {c["name"]: c["type"] for c in cols_info}
-            col_type = col_types.get(pk, "").lower()
-
-            # Only check integer-type PKs
-            if any(t in col_type for t in ("int", "serial", "numeric")):
-                # Use generate_series to find gaps
-                q_pk = _quote_ident(pk)
-                q_schema = _quote_ident(self.schema)
-                q_table = _quote_ident(table)
-                gap_sql = (
-                    "SELECT s.i AS missing_id FROM generate_series(1, "
-                    "(SELECT MAX(%s) FROM %s.%s)) AS s(i) "
-                    "LEFT JOIN %s.%s t ON t.%s = s.i "
-                    "WHERE t.%s IS NULL AND s.i <= %%s "
-                    "ORDER BY s.i LIMIT 100"
-                ) % (q_pk, q_schema, q_table, q_schema, q_table, q_pk, q_pk)
-
-                gaps = self.pool.execute(self.node, gap_sql, (old_max,))
-
-                if gaps:
-                    gap_ids = [g[0] for g in gaps]
-                    gaps_found.append({
-                        "table": table,
-                        "old_max": old_max,
-                        "new_max": new_max,
-                        "missing_ids": gap_ids[:20],
-                        "missing_count": len(gap_ids),
-                    })
 
             entry = {
                 "table": table,
-                "pk_column": pk,
+                "before_count": old_count,
+                "after_count": new_count,
+                "count_delta": new_count - old_count,
                 "old_max": old_max,
-                "new_max": new_max,
+                "new_max": None,
+                "status": "ok",
             }
+
+            pk_cols = self.pool.get_primary_key(self.node, self.schema, table)
+            if old_max is not None and pk_cols and len(pk_cols) == 1:
+                try:
+                    rows = self.pool.execute(
+                        self.node,
+                        "SELECT MAX(%s) FROM %s.%s" % (
+                            _quote_ident(pk_cols[0]),
+                            _quote_ident(self.schema),
+                            _quote_ident(table)),
+                    )
+                    new_max = rows[0][0] if rows else None
+                    entry["new_max"] = new_max
+                    if new_max is not None and new_max < old_max:
+                        entry["status"] = "MAX_REGRESSION"
+                        entry["detail"] = (
+                            "最大主键从 %s 回退到 %s —— 故障前的尾部数据未恢复"
+                            % (old_max, new_max))
+                        losses.append(entry)
+                except Exception as e:
+                    entry["max_error"] = str(e)
+
+            if entry["count_delta"] < 0:
+                entry["status"] = ("MAX_REGRESSION" if entry["status"] == "MAX_REGRESSION"
+                                   else "ROW_LOSS")
+                entry.setdefault("detail", "行数减少 %d 行" % -entry["count_delta"])
+                if entry not in losses:
+                    losses.append(entry)
+
             results.append(entry)
 
         return {
             "batch_id": batch_id,
             "tables_checked": len(results),
-            "gaps_found": len(gaps_found),
-            "success": len(gaps_found) == 0,
+            "tables_with_loss": len(losses),
+            "success": len(losses) == 0,
             "details": results,
-            "gaps": gaps_found,
+            "losses": losses,
+            "note": ("行数减少或最大主键回退都是确定的丢失证据。"
+                     "但本检查无法区分「业务正常删除」与「故障丢失」——"
+                     "唯一可靠的区分手段是应用侧记录（app-db 追踪模式）。"),
         }
 
     def check_all(self, batch_id: str) -> dict:
-        """Run all RPO checks: markers + row counts + sequence gaps.
-
-        Returns comprehensive RPO assessment.
-        """
+        """Run the full RPO assessment: markers + count/key conservation."""
         logger.info("Running full RPO check (batch=%s) ...", batch_id)
 
         markers = self.check_markers(batch_id)
-        counts = self.check_row_counts(batch_id)
-        gaps = self.check_sequence_gaps(batch_id)
+        conservation = self.check_conservation(batch_id)
 
-        data_loss = (
-            not markers["success"] or
-            not counts["success"] or
-            not gaps["success"]
-        )
+        data_loss = not markers["success"] or not conservation["success"]
 
         return {
             "batch_id": batch_id,
@@ -371,12 +351,13 @@ class RPOChecker:
             "rpo_success": not data_loss,
             "data_loss_detected": data_loss,
             "markers": markers,
-            "row_counts": counts,
-            "sequence_gaps": gaps,
+            "conservation": conservation,
             "summary": {
                 "markers_lost": markers["missing"],
-                "rows_lost": -counts["total_delta"] if counts["total_delta"] < 0 else 0,
-                "tables_with_gaps": [g["table"] for g in gaps.get("gaps", [])],
+                "tables_with_loss": conservation["tables_with_loss"],
+                "rows_lost": sum(
+                    -d["count_delta"] for d in conservation["details"]
+                    if d.get("count_delta", 0) < 0),
             },
         }
 

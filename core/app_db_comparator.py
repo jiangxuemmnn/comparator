@@ -21,7 +21,8 @@ import json
 import uuid
 from datetime import datetime
 
-from utils.db import DatabasePool
+from utils.db import DatabasePool, qualified
+from utils.normalize import compare_rows
 
 logger = logging.getLogger("comparator.appdb")
 
@@ -29,17 +30,35 @@ CREATE_TRACKING_TABLE = """
 CREATE TABLE IF NOT EXISTS {schema}._app_db_tracking (
     id SERIAL PRIMARY KEY,
     batch_id VARCHAR(64) NOT NULL,
+    txn_id VARCHAR(64),
+    request_id VARCHAR(128),
     operation VARCHAR(16) NOT NULL,
     table_name VARCHAR(256) NOT NULL,
     pk_values JSONB NOT NULL,
     row_data JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     verified BOOLEAN DEFAULT FALSE,
-    verify_result TEXT
+    verify_result VARCHAR(512)
 );
 """
 
-# Stored function that JMeter calls via SELECT after each business write.
+# Upgrades for tracking tables created by an earlier version. Added
+# separately because CREATE TABLE IF NOT EXISTS leaves an existing table
+# untouched, so a run against an old schema would otherwise fail on the
+# missing columns much later, with a confusing error.
+MIGRATE_TRACKING_TABLE = [
+    "ALTER TABLE {schema}._app_db_tracking ADD COLUMN IF NOT EXISTS txn_id VARCHAR(64)",
+    "ALTER TABLE {schema}._app_db_tracking ADD COLUMN IF NOT EXISTS request_id VARCHAR(128)",
+    "ALTER TABLE {schema}._app_db_tracking ALTER COLUMN verify_result TYPE VARCHAR(512)",
+]
+
+# Stored function that JMeter calls after each business write.
+#
+# txn_id groups several writes that belong to one business transaction, so a
+# transaction that only partly landed can be detected. request_id identifies
+# one client request, so a failed JMeter sample can be matched against what
+# actually reached the database.
+#
 # JMeter JDBC PostProcessor example:
 #   SELECT {schema}.sp_track_write('batch1', 'INSERT', 'accounts',
 #                                  '{"id":123}', '{"id":123,"balance":100}')
@@ -49,14 +68,16 @@ CREATE OR REPLACE FUNCTION {schema}.sp_track_write(
     p_operation VARCHAR,
     p_table_name VARCHAR,
     p_pk_values VARCHAR,
-    p_row_data VARCHAR DEFAULT NULL
+    p_row_data VARCHAR DEFAULT NULL,
+    p_txn_id VARCHAR DEFAULT NULL,
+    p_request_id VARCHAR DEFAULT NULL
 ) RETURNS INTEGER AS $$
 DECLARE
     v_id INTEGER;
 BEGIN
     INSERT INTO {schema}._app_db_tracking
-        (batch_id, operation, table_name, pk_values, row_data)
-    VALUES (p_batch_id, p_operation, p_table_name,
+        (batch_id, txn_id, request_id, operation, table_name, pk_values, row_data)
+    VALUES (p_batch_id, p_txn_id, p_request_id, p_operation, p_table_name,
             p_pk_values::jsonb, p_row_data::jsonb)
     RETURNING id INTO v_id;
     RETURN v_id;
@@ -64,19 +85,27 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
+# All historical signatures, so a table created by an older release can be
+# torn down cleanly.
 DROP_TRACK_FUNCTION = """
+DROP FUNCTION IF EXISTS {schema}.sp_track_write(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
 DROP FUNCTION IF EXISTS {schema}.sp_track_write(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR);
 """
 
 
-def setup_tracking(pool: DatabasePool, node: str, schema: str = "public"):
-    """Create tracking table + stored function on the target node.
-
-    After this, JMeter can call sp_track_write() to record operations.
-    """
+def setup_tracking(pool: DatabasePool, node: str, schema: str = "public",
+                   with_function: bool = True):
+    """Create the tracking table (and stored function) on the target node."""
     pool.execute_ddl(node, CREATE_TRACKING_TABLE.format(schema=schema))
-    pool.execute_ddl(node, CREATE_TRACK_FUNCTION.format(schema=schema))
-    logger.info("Tracking infrastructure created on node '%s' (table + function)", node)
+    for stmt in MIGRATE_TRACKING_TABLE:
+        try:
+            pool.execute_ddl(node, stmt.format(schema=schema))
+        except Exception as e:
+            logger.warning("Tracking table migration skipped: %s", e)
+    if with_function:
+        pool.execute_ddl(node, CREATE_TRACK_FUNCTION.format(schema=schema))
+    logger.info("Tracking infrastructure created on node '%s' (table%s)",
+                node, " + function" if with_function else "")
 
 
 def teardown_tracking(pool: DatabasePool, node: str, schema: str = "public"):
@@ -108,7 +137,8 @@ def verify_batch(pool: DatabasePool, node: str,
     if batch_id:
         records = pool.execute(
             node,
-            "SELECT id, operation, table_name, pk_values, row_data "
+            "SELECT id, batch_id, txn_id, request_id, operation, table_name, "
+            "pk_values, row_data "
             "FROM %s._app_db_tracking "
             "WHERE batch_id = %%s AND NOT verified "
             "ORDER BY id" % schema,
@@ -117,7 +147,8 @@ def verify_batch(pool: DatabasePool, node: str,
     else:
         records = pool.execute(
             node,
-            "SELECT id, operation, table_name, pk_values, row_data "
+            "SELECT id, batch_id, txn_id, request_id, operation, table_name, "
+            "pk_values, row_data "
             "FROM %s._app_db_tracking "
             "WHERE NOT verified "
             "ORDER BY id" % schema,
@@ -130,38 +161,42 @@ def verify_batch(pool: DatabasePool, node: str,
             "total": 0, "verified": 0, "missing": 0,
             "mismatch": 0, "errors_count": 0,
             "success": True, "errors": [],
+            "torn_transactions": [],
         }
 
     verified = 0
     missing = 0
     mismatch = 0
     errors = []
+    ok_ids = []
+    # id -> (verified flag, result text) for one batched write-back.
+    outcomes = []
+    type_cache = {}
 
     for rec in records:
         try:
-            result = _verify_one_record(pool, node, schema, rec)
-            if result["status"] == "ok":
+            result = _verify_one_record(pool, node, schema, rec, type_cache)
+            status = result["status"]
+            if status == "ok":
                 verified += 1
-                if mark_verified:
-                    pool.execute(
-                        node,
-                        "UPDATE %s._app_db_tracking SET verified = TRUE "
-                        "WHERE id = %%s" % schema,
-                        (rec["id"],),
-                        fetch=False,
-                    )
-            elif result["status"] == "missing":
-                missing += 1
+                ok_ids.append(rec["id"])
+                outcomes.append((rec["id"], True, "ok"))
+            else:
+                if status == "missing":
+                    missing += 1
+                elif status == "mismatch":
+                    mismatch += 1
                 errors.append(result)
-            elif result["status"] == "mismatch":
-                mismatch += 1
-                errors.append(result)
+                outcomes.append((rec["id"], False, (result.get("detail") or status)[:500]))
         except Exception as e:
             logger.error("Verify record %d failed: %s", rec["id"], e)
-            errors.append({
-                "id": rec["id"], "status": "error",
-                "detail": str(e),
-            })
+            errors.append({"id": rec["id"], "status": "error", "detail": str(e)})
+            outcomes.append((rec["id"], False, ("error: %s" % e)[:500]))
+
+    if mark_verified:
+        _write_back(pool, node, schema, outcomes)
+
+    torn = _find_torn_transactions(records, outcomes)
 
     return {
         "total": total,
@@ -169,12 +204,79 @@ def verify_batch(pool: DatabasePool, node: str,
         "missing": missing,
         "mismatch": mismatch,
         "errors_count": len(errors),
-        "success": len(errors) == 0,
+        "success": len(errors) == 0 and not torn,
         "errors": errors[:50],
+        "torn_transactions": torn,
     }
 
 
-def _verify_one_record(pool, node, schema, record) -> dict:
+def _write_back(pool, node, schema, outcomes):
+    """Persist verification outcomes in batches.
+
+    Was one UPDATE per record, which dominates the run time once a tracking
+    table holds tens of thousands of rows.
+    """
+    ok_ids = [oid for oid, ok, _ in outcomes if ok]
+    failed = [(oid, txt) for oid, ok, txt in outcomes if not ok]
+    try:
+        if ok_ids:
+            pool.execute(
+                node,
+                "UPDATE %s._app_db_tracking SET verified = TRUE, "
+                "verify_result = 'ok' WHERE id = ANY(%%s)" % schema,
+                (ok_ids,),
+                fetch=False,
+            )
+        for oid, txt in failed:
+            pool.execute(
+                node,
+                "UPDATE %s._app_db_tracking SET verify_result = %%s "
+                "WHERE id = %%s" % schema,
+                (txt, oid),
+                fetch=False,
+            )
+    except Exception as e:
+        logger.warning("写入校验结果失败（不影响本次结论）: %s", e)
+
+
+def _find_torn_transactions(records, outcomes):
+    """Transactions whose writes only partly reached the database.
+
+    A business transaction that inserts an order and updates a balance must
+    leave both changes or neither. If one landed and the other did not, the
+    database committed a partial transaction -- something a per-row check
+    cannot see, because each row on its own looks fine or plainly missing.
+
+    Only possible when the client attached a txn_id; without one there is
+    nothing to group by.
+    """
+    verdict = {oid: ok for oid, ok, _ in outcomes}
+    groups = {}
+    for rec in records:
+        txn = rec.get("txn_id")
+        if not txn:
+            continue
+        groups.setdefault(txn, []).append(rec["id"])
+
+    torn = []
+    for txn, ids in groups.items():
+        if len(ids) < 2:
+            continue
+        results = [verdict.get(i) for i in ids]
+        if all(r is True for r in results) or all(r is False for r in results):
+            continue
+        torn.append({
+            "txn_id": txn,
+            "total_ops": len(ids),
+            "ok_ops": sum(1 for r in results if r is True),
+            "failed_ops": sum(1 for r in results if r is not True),
+            "detail": "同一事务的部分写操作已落库、部分没有 —— 事务被撕裂",
+        })
+    torn.sort(key=lambda d: d["txn_id"])
+    return torn
+
+
+def _verify_one_record(pool, node, schema, record, type_cache=None) -> dict:
     """Verify a single tracking record against the database."""
     op = record["operation"]
     tbl = record["table_name"]
@@ -187,15 +289,10 @@ def _verify_one_record(pool, node, schema, record) -> dict:
 
     where = " AND ".join("%s = %%s" % _quote_ident(k) for k in pk.keys())
     values = list(pk.values())
+    target = qualified(schema, tbl)
 
     if op == "DELETE":
-        rows = pool.execute(
-            node,
-            "SELECT COUNT(*) FROM %s.%s WHERE %s" % (
-                schema, _quote_ident(tbl), where
-            ),
-            values,
-        )
+        rows = pool.execute(node, "SELECT COUNT(*) FROM %s WHERE %s" % (target, where), values)
         if rows[0][0] > 0:
             return {
                 "id": record["id"], "status": "mismatch",
@@ -208,13 +305,7 @@ def _verify_one_record(pool, node, schema, record) -> dict:
         }
 
     # INSERT or UPDATE
-    rows = pool.execute(
-        node,
-        "SELECT * FROM %s.%s WHERE %s" % (
-            schema, _quote_ident(tbl), where
-        ),
-        values,
-    )
+    rows = pool.execute(node, "SELECT * FROM %s WHERE %s" % (target, where), values)
 
     if not rows:
         return {
@@ -225,13 +316,24 @@ def _verify_one_record(pool, node, schema, record) -> dict:
 
     if expected:
         actual = dict(rows[0])
-        diffs = _diff_rows(expected, actual)
+        if type_cache is not None:
+            if tbl not in type_cache:
+                try:
+                    type_cache[tbl] = {
+                        c["name"]: c["type"]
+                        for c in pool.get_column_info(node, schema, tbl)}
+                except Exception:
+                    type_cache[tbl] = {}
+            types = type_cache[tbl]
+        else:
+            types = {}
+        diffs = compare_rows(expected, actual, types)
         if diffs:
             return {
                 "id": record["id"], "status": "mismatch",
                 "operation": op, "table": tbl, "pk": pk,
                 "mismatches": diffs,
-                "detail": "Column value mismatch: %s" % diffs,
+                "detail": "列值不一致: %s" % "; ".join(diffs),
             }
 
     return {
@@ -241,7 +343,7 @@ def _verify_one_record(pool, node, schema, record) -> dict:
 
 
 def get_batch_summary(pool: DatabasePool, node: str,
-                      schema: str = "public") -> dict:
+                      schema: str = "public") -> list:
     """List all batches and their status."""
     rows = pool.execute(
         node,
@@ -334,13 +436,11 @@ def _extract_pk(pool, node, schema, table, row: dict) -> dict:
     return {c: row.get(c) for c in pk_cols}
 
 
-def _diff_rows(expected: dict, actual: dict) -> list[str]:
-    diffs = []
-    for key in expected:
-        if key not in actual:
-            diffs.append("%s: missing in actual" % key)
-        elif str(expected[key]) != str(actual[key]):
-            diffs.append("%s: expected=%s, actual=%s" % (
-                key, expected[key], actual[key]
-            ))
-    return diffs
+def _diff_rows(expected: dict, actual: dict, types: dict = None) -> list:
+    """Deprecated shim kept for callers outside this module.
+
+    The previous implementation compared with str(), which reported
+    Decimal('100.00') vs Decimal('100.0') and True vs 1 as mismatches. The
+    comparison now goes through utils.normalize.compare_rows.
+    """
+    return compare_rows(expected, actual, types)

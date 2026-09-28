@@ -1,5 +1,9 @@
 config.yaml
 
+# 工作笔记，含测试环境的明文服务器口令，不要提交
+Prompt.md
+Prompt_test.md
+
 __pycache__/
 *.pyc
 *.pyo

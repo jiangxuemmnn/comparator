@@ -13,6 +13,15 @@ DEFAULT_CONFIG = {
         "chunk_size": 10000,
         "parallel": 4,
     },
+    # Three-layer object selection (database / schema / table). Empty means
+    # "fall back to comparison.schema + comparison.exclude_tables", which is
+    # how config files written before `scopes` existed keep working.
+    "scopes": [],
+    "consistency": {
+        "mode": "auto",
+        "quiesce_seconds": 5,
+        "lsn_timeout": 30,
+    },
     "rpo": {
         "marker_schema": "public",
     },
