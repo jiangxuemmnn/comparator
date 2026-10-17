@@ -240,6 +240,7 @@ def quote_ident(name: str) -> str:
 - `os.makedirs("")` 在 Python 3.8 上会抛出 `FileNotFoundError`，创建目录前需检查路径非空。
 - `logger.py` 中 `logging.FileHandler` 不存在时会自动创建文件，但不会自动创建目录。
 - `workload/runner.py` 的 `_worker` 多线程模型共享同一个数据库连接 — 已知限制，不适合超高并发。
-- JMeter 集成：`sp_track_write()` 通过 JDBC PostProcessor 调用，需使用独立的 JDBC Connection Configuration 避免连接池争用。
+- JMeter 集成：追踪写入用**第二个 JDBC Request Sampler**——JMeter 没有 JDBC 类型的 PostProcessor（后置处理器只有 JSR223 / 正则 / JSON 提取等），写成 "PostProcessor" 会让人在界面上找不到元件。三个 Sampler（业务 SQL → 追踪写入 → Commit）共用同一个 `autocommit=false` 的连接。可直接用的模板见 `examples/jmeter_tracking.jmx`。
+- **生成 `REQ_ID` 的 PreProcessor 必须挂在业务 Sampler 下**，不能放线程组层级：后者会在每个 Sampler 前都执行，导致业务 SQL 与追踪记录用不同的 ID（实测表现为全部报 Missing）。
 - **日志走 stderr，命令结果走 stdout**（`utils/logger.py` 的 console handler 绑定 `sys.stderr`）。这样 `-f json` 的输出可以直接管道给 `jq`；若把日志改回 stdout，JSON 流会被日志行污染而无法解析。
 - `cli.py` 的 `cmd_schedule` 在轮次之间用 `contextlib.redirect_stdout` 捕获子命令输出以生成报告；收敛指纹**不能用退出码充数**——两个不同的失败都返回 1，只看退出码会让收敛判定建立在错误的前提上。
