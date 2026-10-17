@@ -4,6 +4,11 @@ config.yaml
 Prompt.md
 Prompt_test.md
 
+# 个人/工具产生的目录，不纳入版本管理
+.workbuddy/
+doc/
+kimi/
+
 __pycache__/
 *.pyc
 *.pyo
