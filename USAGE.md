@@ -69,7 +69,14 @@ python cli.py -c config.yaml node-compare --nodes node1,node2,node3
 
 ## 一、节点间数据对比
 
-### 1.1 任意多节点
+### 1.1 任意多节点（没有数量上限）
+
+工具对节点数量**没有上限**，只要求至少 2 个。主机数量、是否一主多备、
+备库有几个都不影响；节点只需在 `config.yaml` 的 `databases` 下各配一项。
+实测过 2 / 3 / 4 / 5 个节点，命令行与输出形式一致。
+
+矩阵模式每个节点只扫描一次，所以节点越多相对收益越大（N 个节点是 N 次扫描，
+逐对比则是 N×(N-1) 次）。
 
 ```bash
 # 两两对比（传统用法，输出为两列）
@@ -320,17 +327,40 @@ consistency:
 
 ### 4.2 改造方式（业务 SQL 一行都不用改）
 
+**先澄清一个容易写错的点：JMeter 没有叫 "JDBC PostProcessor" 的元件。**
+后置处理器里只有 JSR223 / 正则提取 / JSON 提取等，没有 JDBC。要在业务 SQL
+之后写追踪记录，用**第二个 JDBC Request Sampler**（或 JSR223 PostProcessor
+直接调 JDBC API）。下面的写法是实测通过的。
+
+一个线程内按顺序放三个 Sampler，共用同一个 JDBC 连接：
+
 ```
-JDBC Connection Configuration:  autocommit = false     ← 唯一需要改的勾选项
+JDBC Connection Configuration:  Autocommit = false,  Max Number of Connections = 线程数
 
-JDBC Sampler:  <你自己的业务 SQL，原样不动>
-├── PostProcessor 1:  业务成功 → 写追踪记录；业务失败 → 不写
-└── PostProcessor 2:  COMMIT / ROLLBACK
+Thread Group
+├── JDBC Request "business INSERT"        ← 你自己的业务 SQL，原样不动
+│   └── JSR223 PreProcessor "generate REQ_ID"   ← 只挂在这个 Sampler 下
+├── JDBC Request "track write"            ← SELECT sp_track_write(...)
+└── JDBC Request "commit"                 ← Query Type = Commit
 ```
 
-这样业务变更与追踪记录**在同一个事务里**，要么都成功要么都失败，上面那张表的三种错位全部消失。
+这样业务变更与追踪记录**在同一个事务里**，要么都成功要么都失败。业务 SQL 的
+定制能力完全保留：JMeter 变量、函数、参数化、任意 SQL，一切照旧。
 
-而业务 SQL 的定制能力**完全保留**：JMeter 变量、函数、参数化、任意 SQL，一切照旧。
+**两个实测踩过的坑：**
+
+1. **`REQ_ID` 必须挂在业务 Sampler 下面，不能放在线程组层级。**
+   放在线程组上的 PreProcessor 会在**每个 Sampler 之前**都执行一次，
+   结果业务 SQL 用 ID `A`、追踪写入用重新生成的 ID `B`，两者永远对不上
+   （实测表现为 `app-db-verify` 全部报 Missing）。
+2. **`row_data` 必须与业务 SQL 实际写入的值一致。** 追踪记录里的值是
+   "应用声称写了什么"，不是"随便填什么"。实测中把 `v` 写死为 1，
+   而业务写入用的是随机值，10 条记录全部判为 mismatch。
+
+可直接使用的模板见 `examples/jmeter_tracking.jmx`（已在 oracle 模式下实测：
+2 线程 × 5 循环，10 条业务写入、10 条追踪记录、校验全部通过、JTL 对账四象限正确）。
+
+**sqlserver 模式**：把 `track write` 换成 `app-db-setup` 打印的普通 INSERT 即可。
 
 ### 4.3 使用步骤
 
@@ -717,8 +747,10 @@ A：不需要。内置引擎不依赖任何外部工具，只需 `psycopg2`、`p
 **Q：支持 Kingbase 的哪些兼容模式？**
 A：Oracle / PostgreSQL / MySQL / SQLServer 四种都支持。工具不按模式名做判断，而是**直接探测数据库的实际能力**（LSN 函数是否可用、变更计数器是否可读、时间戳列是否存在等），因此小版本差异不会导致误判。
 
-**Q：一主两备怎么对比？**
+**Q：一主两备怎么对比？能支持更多节点吗？**
 A：`python cli.py -c config.yaml node-compare --nodes node1,node2,node3`。工具会直接指出哪个节点是异类。
+**节点数量没有上限**，`--nodes` 后面按逗号列出即可（如 5 个、10 个），
+前提是每个节点都在 `config.yaml` 里配置过。
 
 **Q：报出了差异，怎么定位到具体行？**
 A：默认就会定位。`checksum` 引擎发现差异块后会在块内逐行比对，直接给出「仅前者有 / 仅后者有 / 值不同」的具体主键值。

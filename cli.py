@@ -29,6 +29,8 @@ import signal
 import json
 from datetime import datetime
 
+__version__ = "2.0.0"
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -137,7 +139,9 @@ def _print_result(result: dict, fmt: str = "table"):
     if inconclusive:
         print("\n以下表的结论不完整:")
         for r in inconclusive:
-            print("  [%s] %s" % (r.get("table"), r.get("note") or r.get("confidence")))
+            reason = (r.get("error") or r.get("note")
+                      or r.get("confidence") or "未知原因")
+            print("  [%s] %s" % (r.get("table"), reason))
 
 
 def cmd_node_compare(args, config, pool):
@@ -948,6 +952,30 @@ def cmd_init_config(args, config, pool):
     return 0
 
 
+def _validate_node_args(args, config):
+    """Turn a mistyped node name into a usable message.
+
+    Without this, `-a nodeX` surfaces as a bare KeyError from deep inside
+    the pool, with a traceback and no hint about which names are valid.
+    """
+    known = set(config.get("databases", {}) or {})
+    used = []
+    for attr in ("node", "node_a", "node_b"):
+        value = getattr(args, attr, None)
+        if value:
+            used.append(value)
+    nodes = getattr(args, "nodes", None)
+    if nodes:
+        used.extend(n.strip() for n in nodes.split(",") if n.strip())
+
+    missing = [n for n in used if n not in known]
+    if missing:
+        raise ValueError(
+            "节点 %s 未在配置中定义。可用节点: %s"
+            % (", ".join("'%s'" % n for n in missing),
+               ", ".join(sorted(known)) or "(配置中没有任何节点)"))
+
+
 def _build_cmd_map():
     """Build mapping of command names to functions."""
     return {
@@ -1018,6 +1046,8 @@ Examples:
         """,
     )
 
+    parser.add_argument("--version", action="version",
+                        version="comparator %s" % __version__)
     parser.add_argument("-c", "--config", default="config.yaml",
                         help="Path to YAML config file (default: config.yaml)")
     parser.add_argument("--schema", default=None,
@@ -1197,6 +1227,7 @@ def main():
     try:
         if args.command not in ("init-config",):
             config = load_config(args.config)
+            _validate_node_args(args, config)
             pool = DatabasePool(config)
 
         return cmd_func(args, config, pool)
