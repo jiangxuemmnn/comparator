@@ -611,6 +611,90 @@ def cmd_run_workload(args, config, pool):
     return 0 if stats["error_ops"] == 0 else 1
 
 
+def cmd_check_config(args, config, pool):
+    """Connectivity and environment self-check.
+
+    One command that answers "did I configure this right, and is the
+    cluster in the state I think it is" before a test campaign starts:
+    every node's reachability, compatibility mode, primary/standby role,
+    sync position, version, and how many tables the comparison will see.
+    """
+    logger = setup_logger(config)
+    schema = args.schema or config["comparison"]["schema"]
+    all_nodes = list((config.get("databases") or {}).keys())
+    nodes = ([n.strip() for n in args.nodes.split(",") if n.strip()]
+             if args.nodes else all_nodes)
+
+    if not nodes:
+        print("配置中没有定义任何节点。")
+        return 2
+
+    unknown = [n for n in nodes if n not in all_nodes]
+    if unknown:
+        print("节点 %s 未在配置中定义。可用节点: %s"
+              % (", ".join("'%s'" % n for n in unknown), ", ".join(all_nodes)))
+        return 2
+
+    cmp_cfg = config.get("comparison", {}) or {}
+    cons_cfg = config.get("consistency", {}) or {}
+    print("配置: schema=%s  chunk_size=%s  parallel=%s  一致性=%s"
+          % (schema, cmp_cfg.get("chunk_size", 10000),
+             cmp_cfg.get("parallel", 4), cons_cfg.get("mode", "auto")))
+    print("待检查节点: %s" % ", ".join(nodes))
+    print()
+
+    rows = []
+    reachable = 0
+    primaries = []
+    for n in nodes:
+        dbcfg = config["databases"].get(n, {}) or {}
+        addr = "%s:%s/%s" % (dbcfg.get("host", "?"),
+                             dbcfg.get("port", 54321), dbcfg.get("dbname", "?"))
+        missing = [f for f in ("host", "dbname", "user") if not dbcfg.get(f)]
+        if missing:
+            rows.append([n, addr, "FAIL", "-", "-", "-", "缺少字段: " + ",".join(missing)])
+            continue
+        try:
+            pool.get_conn(n)
+            mode = pool._mode_cache.get(n) or "?"
+            rec = pool.is_in_recovery(n)
+            if not rec:
+                primaries.append(n)
+            try:
+                ver = pool.execute(n, "SELECT version()")[0][0]
+            except Exception:
+                ver = "?"
+            lsn = pool.current_wal_lsn(n) or pool.last_wal_replay_lsn(n) or "-"
+            ntab = len(pool.get_tables(n, schema))
+            rows.append([n, addr, "OK", mode, "备库" if rec else "主库",
+                         "%d 表 / %s" % (ntab, lsn), ver])
+            reachable += 1
+        except Exception as e:
+            rows.append([n, addr, "FAIL", "-", "-", "-",
+                         str(e).strip().splitlines()[0][:70]])
+
+    from tabulate import tabulate
+    print(tabulate(rows, headers=["节点", "地址", "状态", "模式", "角色",
+                                  "表数 / LSN", "版本"], tablefmt="grid"))
+    print()
+
+    if reachable == len(nodes):
+        print("结论: %d 个节点全部可达。" % reachable)
+    else:
+        print("结论: %d/%d 个节点可达，其余不可用。"
+              % (reachable, len(nodes)))
+    if len(primaries) > 1:
+        print("注意: 检测到 %d 个主库（%s）。同一集群通常应只有一个主库；"
+              "若这是有意为之（多主/双活），LSN 判据不适用。"
+              % (len(primaries), ", ".join(primaries)))
+    elif not primaries and reachable:
+        print("注意: 没有检测到主库，全部节点都在 recovery 中。")
+    if reachable:
+        print("提示: 下一步可运行 node-compare --nodes %s" % ",".join(nodes))
+
+    return 0 if reachable == len(nodes) else 2
+
+
 def cmd_schema_compare(args, config, pool):
     """Compare database SCHEMAS (DDL) between two nodes via the pgdiff tool.
 
@@ -999,6 +1083,8 @@ def _build_cmd_map():
         "gen-data": cmd_gen_data,
         "run_workload": cmd_run_workload,
         "run-workload": cmd_run_workload,
+        "check_config": cmd_check_config,
+        "check-config": cmd_check_config,
         "schema_compare": cmd_schema_compare,
         "schema-compare": cmd_schema_compare,
         "list_backends": cmd_list_backends,
@@ -1174,6 +1260,12 @@ Examples:
     p_scp.add_argument("--schema-type", default="ALL",
                        choices=list(SCHEMA_TYPES) + ["ALL"],
                        help="要对比的对象类型（默认 ALL，按依赖顺序全部对比）")
+
+    # check-config — 配置与连通性自检
+    p_chk = sub.add_parser("check-config", parents=[common],
+        help="检查配置与各节点的连通性、兼容模式、主备角色")
+    p_chk.add_argument("--nodes", default=None,
+                       help="只检查指定节点，逗号分隔（默认全部）")
 
     # list-backends
     sub.add_parser("list-backends", parents=[common], help="List available comparison backends")

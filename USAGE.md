@@ -58,10 +58,13 @@ python cli.py init-config
 
 # 2. 编辑 config.yaml，至少填写 databases 下的节点连接信息
 
-# 3. 生成一点测试数据（在可写的节点上）
+# 3. 环境自检：逐节点确认可达、兼容模式、主备角色
+python cli.py -c config.yaml check-config
+
+# 4. 生成一点测试数据（在可写的节点上）
 python cli.py -c config.yaml gen-data -n node1 --accounts 5000
 
-# 4. 对比（一主两备一次比完）
+# 5. 对比（一主两备一次比完）
 python cli.py -c config.yaml node-compare --nodes node1,node2,node3
 ```
 
@@ -616,6 +619,28 @@ python cli.py -c config.yaml node-compare --nodes node1,node2,node3 -f json | jq
 | `app-db-verify -n <节点> [--batch-id <id>] [--no-mark]` | 校验追踪记录，含撕裂事务检测 |
 | `app-db-status -n <节点>` | 批次摘要 |
 | `app-db-teardown -n <节点>` | 清理 |
+
+### check-config — 配置与环境自检
+
+```bash
+python cli.py -c config.yaml check-config
+python cli.py -c config.yaml check-config --nodes node1,node2
+```
+
+在任何测试开始前先跑一次，它会逐节点打印：**是否可达、兼容模式、主备角色、
+表数量、当前 LSN、数据库版本**，并在最后给出结论与下一步建议。
+
+```
+| 节点  | 地址                        | 状态 | 模式   | 角色 | 表数 / LSN        |
+| node1 | 10.217.0.106:53261/kingbase | OK   | oracle | 备库 | 4 表 / 0/1A6EA9E0 |
+| node2 | 10.217.0.105:53261/kingbase | OK   | oracle | 主库 | 4 表 / 0/1A6EA9E0 |
+| node3 | 10.217.0.104:53261/kingbase | OK   | oracle | 备库 | 4 表 / 0/1A6EA9E0 |
+```
+
+退出码：`0` 全部可达；`2` 有节点不可达。检测到多个主库或没有主库时会额外提示
+（这两种情况会影响 LSN 判据的适用性）。
+
+连接失败会自动重试 2 次，短暂网络抖动不会直接中断测试。
 
 ### schema-compare
 

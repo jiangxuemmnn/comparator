@@ -12,6 +12,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # 生成配置文件
 python cli.py init-config
 
+# 配置与环境自检（模式 / 主备 / 可达性 / 表数 / LSN）
+python cli.py -c config.yaml check-config
+
 # 表结构对比（pgdiff 外部工具，与数据对比分开）
 python cli.py -c config.yaml schema-compare -a node1 -b node2
 
@@ -92,6 +95,7 @@ cli.py (argparse 子命令路由)
 - **`stream_cursor(name, sql, params, itersize)`** — 服务端（命名）游标，用于流式读取大表。**使用独占连接**，因为命名游标必须活在事务里，多线程通过共享连接并发流式读取会互相回滚对方的事务。
 - **`resolve_table(name, schema, table)`** — 返回表的真实存储名，按原名/小写/大写依次尝试；找不到抛 `TableNotFound`。`get_primary_key` / `get_column_info` 内部都先调用它。
 - **`get_key_bounds`** / **`table_change_counter`** / **`current_wal_lsn`** / **`last_wal_replay_lsn`** / **`is_in_recovery`** — 矩阵分块与一致性判定使用。
+- **`_connect(name, retries=2)`** — 打开连接；可重试的 OperationalError 会自动重试 2 次（认证/配置类错误不重试）。集群故障测试中网络抖动是常态，单次失败不应中断整轮。
 - **`get_dsn_parameters()` 不存在**（`psycopg2` 的 connection 对象上有同名方法，但 `DatabasePool` 没有暴露）。需要密码传给外部工具时从 `pool._config["databases"][name]["password"]` 读取。
 
 ### Kingbase 兼容模式差异（实测，V009R001C010）

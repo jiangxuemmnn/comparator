@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -178,18 +179,43 @@ class DatabasePool:
             "SQL 执行失败，但 Kingbase 的 sqlserver 兼容模式未返回错误信息"
             "（@@ERROR=%s）: %s" % (code, " ".join((sql or "").split())[:200]))
 
+    def _connect(self, name: str, retries: int = 2):
+        """Open a connection, retrying a transient failure a couple of times.
+
+        A single "server closed the connection unexpectedly" used to abort a
+        whole comparison run -- which is exactly the kind of error a cluster
+        under failover testing produces routinely. Retrying is cheap and
+        turns a flaky blip into a slow success instead of no answer at all.
+        Authentication and configuration errors are not retried: they will
+        not fix themselves.
+        """
+        dbcfg = self._config["databases"][name]
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                return psycopg2.connect(
+                    host=dbcfg["host"],
+                    port=dbcfg.get("port", 54321),
+                    dbname=dbcfg["dbname"],
+                    user=dbcfg["user"],
+                    password=dbcfg.get("password", ""),
+                    connect_timeout=dbcfg.get("connect_timeout", 10),
+                )
+            except psycopg2.OperationalError as e:
+                last = e
+                text = str(e).lower()
+                if "authentication" in text or "does not exist" in text:
+                    raise
+                if attempt < retries:
+                    logger.warning("连接节点 %s 失败（第 %d 次），重试: %s",
+                                   name, attempt + 1, str(e).splitlines()[0])
+                    time.sleep(0.5 * (attempt + 1))
+        raise last
+
     def get_conn(self, name: str):
         """Get or create a connection to a named database node."""
         if name not in self._conns or self._conns[name].closed:
-            dbcfg = self._config["databases"][name]
-            conn = psycopg2.connect(
-                host=dbcfg["host"],
-                port=dbcfg.get("port", 54321),
-                dbname=dbcfg["dbname"],
-                user=dbcfg["user"],
-                password=dbcfg.get("password", ""),
-                connect_timeout=dbcfg.get("connect_timeout", 10),
-            )
+            conn = self._connect(name)
             mode = self._detect_mode(name, conn)
             # sqlserver mode: no implicit BEGIN, so every statement runs and
             # commits on its own. Reads are unaffected; writes already used
@@ -292,15 +318,7 @@ class DatabasePool:
           `DECLARE ... WITH HOLD` cursor gives the same batched, server-side
           iteration without needing a psycopg2-managed transaction.
         """
-        dbcfg = self._config["databases"][name]
-        conn = psycopg2.connect(
-            host=dbcfg["host"],
-            port=dbcfg.get("port", 54321),
-            dbname=dbcfg["dbname"],
-            user=dbcfg["user"],
-            password=dbcfg.get("password", ""),
-            connect_timeout=dbcfg.get("connect_timeout", 10),
-        )
+        conn = self._connect(name)
 
         mode = self._mode_cache.get(name)
         if mode is None:
