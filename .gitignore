@@ -21,3 +21,7 @@ logs/
 reports/
 offline_pkgs/
 .env
+
+# JMeter 运行时产物
+jmeter.log
+*.jtl
