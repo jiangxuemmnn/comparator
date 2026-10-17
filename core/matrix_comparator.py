@@ -48,13 +48,14 @@ VOTING_WARNING = (
 
 
 def _scan(pool, node, schema, table, cols, types, pk_cols, cuts,
-          watermark, retries=2):
+          watermark, retries=2, chunk_size=10000):
     """Scan one node, retrying transient failures before giving up."""
     last = None
     for attempt in range(retries + 1):
         try:
             _, chunks = scan_digests(pool, node, schema, table, cols, types,
-                                     pk_cols, cuts=cuts, watermark=watermark)
+                                     pk_cols, cuts=cuts, watermark=watermark,
+                                     chunk_size=chunk_size)
             return chunks, None
         except Exception as e:
             last = e
@@ -115,10 +116,13 @@ def run_multi_node_comparison(pool, config, nodes, backend="checksum",
 
     if backend != "checksum":
         raise ValueError(
-            "矩阵模式仅支持 checksum 引擎。"
-            "pg_comparator / data_diff 是两两对比工具，无法做多节点矩阵；"
-            "请改用 --backend checksum，或用 -a/-b 显式指定一对节点。")
+            "矩阵模式仅支持 checksum 引擎，当前指定的是 %s。"
+            "native 需要逐行读取双方数据，多节点矩阵下代价过高；"
+            "pg_comparator / data_diff 本身就是两两对比工具。"
+            "请改用 --backend checksum，或用 -a/-b 显式指定一对节点。"
+            % backend)
 
+    chunk_size = (config.get("comparison", {}) or {}).get("chunk_size", 10000)
     started = time.time()
     results = []
     tables_diff = 0
@@ -137,7 +141,27 @@ def run_multi_node_comparison(pool, config, nodes, backend="checksum",
 
     live_nodes = [n for n in nodes if reachable[n]]
     if base not in live_nodes:
-        raise RuntimeError("基准节点 %s 不可达，无法继续" % base)
+        # Structured answer rather than an exception: the run could not
+        # produce a verdict, which is exit 2, not a traceback and exit 1.
+        return {
+            "success": False,
+            "conclusion": INCONCLUSIVE,
+            "exit_code": 2,
+            "backend": backend,
+            "mode": "primary" if primary else "matrix-vote",
+            "base": base,
+            "nodes": list(nodes),
+            "unreachable": [n for n in nodes if not reachable[n]],
+            "schema": schema,
+            "tables_checked": 0,
+            "tables_diff": 0,
+            "tables_inconclusive": 0,
+            "total_chunks": 0,
+            "outlier_summary": [],
+            "warnings": ["基准节点 %s 不可达，本轮无法给出结论" % base],
+            "results": [],
+            "total_time": round(time.time() - started, 2),
+        }
 
     outlier_chunks = {n: 0 for n in live_nodes}
     outlier_tables = {n: set() for n in live_nodes}
@@ -146,7 +170,8 @@ def run_multi_node_comparison(pool, config, nodes, backend="checksum",
     for table in tables:
         t_result = _compare_one_table(
             pool, base, live_nodes, schema, table, watermark,
-            max_workers, max_diff_rows, all_nodes=nodes)
+            max_workers, max_diff_rows, all_nodes=nodes,
+            chunk_size=chunk_size)
         t_result["rows"] = {n: (t_result["rows"].get(n) if
                                 t_result["rows"].get(n) is not None else None)
                             for n in nodes}
@@ -224,7 +249,8 @@ def run_multi_node_comparison(pool, config, nodes, backend="checksum",
 
 
 def _compare_one_table(pool, base, live_nodes, schema, table, watermark,
-                       max_workers, max_diff_rows, all_nodes=None):
+                       max_workers, max_diff_rows, all_nodes=None,
+                       chunk_size=10000):
     """Build the chunk matrix for one table and reduce it to a verdict.
 
     `all_nodes` is the full requested node list; `live_nodes` is the subset
@@ -290,7 +316,7 @@ def _compare_one_table(pool, base, live_nodes, schema, table, watermark,
     try:
         cuts, base_chunks = scan_digests(
             pool, base, schema, real, cols, types, pk_cols,
-            cuts=None, watermark=watermark)
+            cuts=None, watermark=watermark, chunk_size=chunk_size)
         entry["node_status"][base] = "OK"
         entry["rows"][base] = pool.get_row_count(base, schema, real)
     except Exception as e:
@@ -304,7 +330,7 @@ def _compare_one_table(pool, base, live_nodes, schema, table, watermark,
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(others) or 1))) as ex:
         futures = {
             ex.submit(_scan, pool, n, schema, real, cols, types, pk_cols,
-                      cuts, watermark): n
+                      cuts, watermark, chunk_size=chunk_size): n
             for n in others
         }
         for fut in as_completed(futures):
@@ -355,6 +381,10 @@ def _compare_one_table(pool, base, live_nodes, schema, table, watermark,
         elif verdict == "UNRESOLVED":
             unresolved += 1
             detail["note"] = "无严格多数派，无法定位异类节点"
+            entry["diff_details"].append(
+                "Chunk %d: 无严格多数派（分组=%s，行数=%s）—— "
+                "无法判定哪一组正确，需要用 --primary 指定基准或人工核对"
+                % (i, detail["groups"], rows))
 
         entry["chunk_detail"].append(detail)
 

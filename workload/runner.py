@@ -106,7 +106,11 @@ class WorkloadRunner:
 
     def _run_transaction(self, txn_def: dict, conn_name: str):
         """Execute a single transaction (can be multi-statement)."""
-        sql_template = txn_def["sql"]
+        # `{schema}` is substituted here, not only in the DDL path. Without
+        # this a transaction SQL still contains the literal `{schema}` and
+        # every statement fails to parse -- the bundled transfer.yaml ran
+        # 900 operations with 0 successes before this fix.
+        sql_template = txn_def["sql"].replace("{schema}", self.schema)
 
         # Replace placeholders with random values
         sql = self._interpolate_sql(sql_template)

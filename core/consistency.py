@@ -190,7 +190,14 @@ class ConsistencySession:
         quiet = None      # None = no evidence either way
         basis = None
 
-        # Signal 1: LSN bracketing. Authoritative when available.
+        # Sample the per-table counters once, whatever the LSN says. They
+        # are needed both as a fallback and as a cross-check below.
+        counter = None
+        if ctx.get("counter_start") is not None:
+            counter, _ = self.pool.table_change_counter(
+                self.base, ctx["schema"], ctx["tables"])
+
+        # Signal 1: LSN bracketing.
         if ctx.get("lsn_start") is not None:
             primary = self.capabilities.get("primary")
             lsn_end = self.pool.current_wal_lsn(primary)
@@ -198,20 +205,28 @@ class ConsistencySession:
                 if lsn_end == ctx["lsn_start"]:
                     quiet, basis = True, "读取期间主库 LSN 未变化（%s）" % lsn_end
                 else:
-                    quiet, basis = False, "读取期间主库 LSN 由 %s 推进到 %s" % (
-                        ctx["lsn_start"], lsn_end)
+                    # The LSN moves for reasons that have nothing to do with
+                    # the data under test: repmgr heartbeats, autovacuum,
+                    # checkpoints. On a managed cluster that alone made the
+                    # verdict drop to `snapshot` at random. If the counters
+                    # for the compared tables did not move, nothing was
+                    # written to them and the run is still deterministic.
+                    if counter is not None and counter == ctx["counter_start"]:
+                        quiet, basis = True, (
+                            "主库 LSN 由 %s 推进到 %s，但被测表变更计数未变化 —— "
+                            "推进来自后台 WAL（心跳/autovacuum/checkpoint），"
+                            "不是业务写入" % (ctx["lsn_start"], lsn_end))
+                    else:
+                        quiet, basis = False, "读取期间主库 LSN 由 %s 推进到 %s" % (
+                            ctx["lsn_start"], lsn_end)
 
-        # Signal 2: per-table change counters. Catches writes the LSN check
-        # cannot see when no primary connection is configured.
-        if quiet is None and ctx.get("counter_start") is not None:
-            counter, _ = self.pool.table_change_counter(
-                self.base, ctx["schema"], ctx["tables"])
-            if counter is not None:
-                if counter == ctx["counter_start"]:
-                    quiet, basis = True, "读取期间被测表变更计数未变化"
-                else:
-                    quiet, basis = False, "读取期间被测表变更计数 %s -> %s" % (
-                        ctx["counter_start"], counter)
+        # Signal 2: per-table change counters, when there is no LSN to use.
+        if quiet is None and counter is not None:
+            if counter == ctx["counter_start"]:
+                quiet, basis = True, "读取期间被测表变更计数未变化"
+            else:
+                quiet, basis = False, "读取期间被测表变更计数 %s -> %s" % (
+                    ctx["counter_start"], counter)
 
         if quiet is True:
             confidence = DETERMINISTIC

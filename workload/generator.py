@@ -23,8 +23,8 @@ TABLE_TEMPLATES = {
             balance NUMERIC(18,2) DEFAULT 0.00,
             status VARCHAR(16) DEFAULT 'active',
             branch_code VARCHAR(16),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at {ts} DEFAULT CURRENT_TIMESTAMP,
+            updated_at {ts} DEFAULT CURRENT_TIMESTAMP
         )
     """,
     "orders": """
@@ -36,7 +36,7 @@ TABLE_TEMPLATES = {
             quantity INTEGER DEFAULT 1,
             amount NUMERIC(18,2),
             order_status VARCHAR(16) DEFAULT 'pending',
-            order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            order_date {ts} DEFAULT CURRENT_TIMESTAMP
         )
     """,
     "products": """
@@ -47,7 +47,7 @@ TABLE_TEMPLATES = {
             unit_price NUMERIC(18,2),
             stock INTEGER DEFAULT 0,
             category VARCHAR(64),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at {ts} DEFAULT CURRENT_TIMESTAMP
         )
     """,
     "transactions": """
@@ -59,7 +59,7 @@ TABLE_TEMPLATES = {
             amount NUMERIC(18,2),
             txn_type VARCHAR(32),
             txn_status VARCHAR(16) DEFAULT 'completed',
-            txn_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            txn_time {ts} DEFAULT CURRENT_TIMESTAMP,
             remark TEXT
         )
     """,
@@ -88,7 +88,9 @@ class DataGenerator:
         if not sql:
             raise ValueError("Unknown template: %s. Available: %s" % (
                 template_name, list(TABLE_TEMPLATES.keys())))
-        self.pool.execute_ddl(self.node, sql.format(schema=self.schema))
+        self.pool.execute_ddl(self.node, sql.format(
+            schema=self.schema,
+            ts=self.pool.timestamp_type(self.node)))
         logger.info("Created table %s.%s", self.schema, template_name)
 
     def create_all_tables(self):

@@ -115,7 +115,20 @@ def reconcile(pool: DatabasePool, node, jtl_path, batch_id=None,
               schema="public", id_column=None, check_orphans=True,
               orphan_limit=200):
     """Compare a JTL result file with the database."""
-    by_request, stats = parse_jtl(jtl_path, id_column=id_column)
+    try:
+        by_request, stats = parse_jtl(jtl_path, id_column=id_column)
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": "JTL 文件不存在: %s" % jtl_path,
+            "jtl_stats": {},
+        }
+    except OSError as e:
+        return {
+            "success": False,
+            "error": "无法读取 JTL 文件 %s: %s" % (jtl_path, e),
+            "jtl_stats": {},
+        }
 
     if stats["id_column"] is None:
         return {

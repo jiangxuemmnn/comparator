@@ -94,6 +94,27 @@ cli.py (argparse 子命令路由)
 - **`get_key_bounds`** / **`table_change_counter`** / **`current_wal_lsn`** / **`last_wal_replay_lsn`** / **`is_in_recovery`** — 矩阵分块与一致性判定使用。
 - **`get_dsn_parameters()` 不存在**（`psycopg2` 的 connection 对象上有同名方法，但 `DatabasePool` 没有暴露）。需要密码传给外部工具时从 `pool._config["databases"][name]["password"]` 读取。
 
+### Kingbase 兼容模式差异（实测，V009R001C010）
+
+四套集群（oracle 53261 / mysql 53262 / sqlserver 53263 / pg 53264）实测得到。
+**sqlserver 模式与其余三种差异最大**，以下每一条都已在代码中适配：
+
+| 差异 | 影响 | 处理方式 |
+|---|---|---|
+| `autocommit=False` 时 psycopg2 发出裸 `BEGIN`，被拒绝（`syntax error at end of input`） | 所有命令在第一个语句就失败 | `get_conn` 探测 `SHOW database_mode`，sqlserver 模式设 `autocommit=True` |
+| psycopg2 命名游标不可用（它按 `conn.autocommit` 判断） | `stream_cursor` 全挂 | 改用 `DECLARE ... WITH HOLD` + `COMMIT` + 分批 `FETCH`（`_HoldCursor`） |
+| **运行时错误被静默吞掉**：不存在的表、除零、主键冲突都不抛异常 | 查询失败会被当成"零行"，结论完全不可信 | `_check_statement` 用空的 `statusmessage` 判定失败；`@@ERROR` 只能拿到数字码，没有错误文本 |
+| `TIMESTAMP` 是 T-SQL 的 rowversion，不能带 `DEFAULT` | 所有带 `DEFAULT CURRENT_TIMESTAMP` 的建表失败 | `pool.timestamp_type(node)` 返回 `DATETIME` |
+| 不支持 `\|\|` 字符串拼接 | RPO 探针 INSERT 失败 | 改用 `concat(concat(a,b),c)`（四模式通用；`+` 在 oracle/pg 不通用） |
+| `ALTER TABLE ... ADD COLUMN` 语法错误 | 追踪表迁移失败 | 用 `ALTER TABLE t ADD <col> <type>`（不带 `COLUMN`），先查列是否存在 |
+| **plpgsql 函数体内任何 INSERT 都失败** | `sp_track_write` 不可用 | sqlserver 模式不创建该函数，`app-db-setup` 打印普通 INSERT 模板 |
+| plpgsql `INTO` 赋值不支持（`SELECT INTO` / `RETURNING INTO`） | 函数无法返回值 | `sp_track_write` 改为 `RETURNS VOID` |
+| `= ANY(array)` 不支持 | 批量查询/更新失败 | 改用 `IN (...)` 动态占位符 |
+
+**其余三种模式**：`TIMESTAMP`/`SERIAL`/`JSONB`/`BOOLEAN`/`plpgsql`/`EXCEPT`/`LIMIT`/
+`string_agg` 均可用；pg 模式只有 `pg_*` 函数（无 `sys_*`、无 `listagg`/`wm_concat`）；
+mysql 模式无 `plsql`；oracle 模式 `''` 与 NULL 不可区分。
+
 ### 值归一化 (`utils/normalize.py`)
 
 **跨节点比较必须先过这一层**，否则会产生大量假差异。归一化把「值 + 列类型」映射成规范字节串，同时被 checksum 引擎和 app-DB 校验共用。

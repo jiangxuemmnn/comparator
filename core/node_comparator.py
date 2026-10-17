@@ -43,7 +43,7 @@ BACKENDS = {
 # from comparing rows, and conflating them would make a schema difference
 # look like a data difference.
 SCHEMA_BACKENDS = {
-    "pgdiff": "pgdiff 外部工具，对比 PostgreSQL/Kingbase 的 schema 差异（Java）",
+    "pgdiff": "pgdiff 外部工具（Go），对比 PostgreSQL/Kingbase 的 schema 差异",
 }
 
 # Backends that can only ever compare one pair of nodes.
@@ -69,7 +69,10 @@ def list_backends() -> dict:
             "description": desc,
             "available": _check(name),
             "kind": "data",
-            "multi_node": name not in PAIRWISE_ONLY,
+            # Only checksum has a matrix implementation; `native` and the
+            # external tools are pairwise. Reporting otherwise made
+            # `list-backends` promise a mode the CLI rejects.
+            "multi_node": name == "checksum",
         }
     for name, desc in SCHEMA_BACKENDS.items():
         result[name] = {
@@ -228,6 +231,7 @@ def run_node_comparison(pool: DatabasePool, config: dict,
 
     results = []
     tables_diff = 0
+    tables_inconclusive = 0
 
     with ThreadPoolExecutor(max_workers=parallel) as executor:
         futures = {}
@@ -248,7 +252,10 @@ def run_node_comparison(pool: DatabasePool, config: dict,
             try:
                 r = future.result()
                 results.append(r)
-                if not r.get("identical"):
+                if _is_inconclusive(r):
+                    tables_inconclusive += 1
+                    logger.warning("Table %s.%s could not be fully compared", s, table)
+                elif not r.get("identical"):
                     tables_diff += 1
                     logger.warning("Table %s.%s differs!", s, table)
             except Exception as e:
@@ -259,20 +266,50 @@ def run_node_comparison(pool: DatabasePool, config: dict,
                     "identical": False,
                     "confidence": "unavailable",
                 })
-                tables_diff += 1
+                tables_inconclusive += 1
 
     total_time = time.time() - start_time
+    # Same three-way verdict as the matrix path, so the two entry points
+    # cannot disagree about what a given situation means.
+    if tables_diff:
+        conclusion, exit_code = "DIVERGENT", 1
+    elif tables_inconclusive:
+        conclusion, exit_code = "INCONCLUSIVE", 2
+    else:
+        conclusion, exit_code = "CONSISTENT", 0
+
     return {
-        "success": tables_diff == 0,
-        "conclusion": "DIVERGENT" if tables_diff else "CONSISTENT",
-        "exit_code": 1 if tables_diff else 0,
+        "success": conclusion == "CONSISTENT",
+        "conclusion": conclusion,
+        "exit_code": exit_code,
         "backend": backend,
         "tables_checked": len(results),
         "tables_diff": tables_diff,
+        "tables_inconclusive": tables_inconclusive,
         "total_chunks_diff": sum(r.get("chunks_diff", 0) for r in results),
         "total_time": round(total_time, 2),
         "results": results,
     }
+
+
+def _is_inconclusive(result: dict) -> bool:
+    """True when a table's result cannot support a PASS or FAIL.
+
+    `aborted` (native refused an oversized table), `unavailable` (the query
+    failed) and `row_count_only` all mean the content was never compared.
+    Treating them as "differs" made a tool limitation look like a detected
+    inconsistency -- exit 1 -- while the matrix path called the same
+    situation INCONCLUSIVE.
+
+    A row-count-only result whose counts actually differ IS a real finding,
+    so that case stays divergent.
+    """
+    conf = result.get("confidence")
+    if conf in ("aborted", "unavailable"):
+        return True
+    if conf == "row_count_only":
+        return bool(result.get("identical"))
+    return False
 
 
 # ---------------------------------------------------------------------------

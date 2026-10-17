@@ -2,9 +2,30 @@
 
 ## 环境要求
 
-- Python 3.8+
+- Python 3.11+
 - Kingbase（Oracle / PostgreSQL / MySQL / SQLServer 任一兼容模式）或 PostgreSQL
 - 操作系统：Linux
+
+## Kingbase 兼容模式
+
+四种模式（Oracle / PostgreSQL / MySQL / SQLServer）均已完成实测，命令用法完全相同，
+差异只在内部实现。工具会在连接时自动探测数据库模式，不需要额外配置。
+
+| 能力 | oracle | mysql | sqlserver | pg |
+|---|---|---|---|---|
+| 节点对比（checksum / native） | ✅ | ✅ | ✅ | ✅ |
+| 多节点矩阵 + 异常定位 | ✅ | ✅ | ✅ | ✅ |
+| 一致性判定（LSN / 变更计数） | ✅ | ✅ | ✅ | ✅ |
+| 应用-DB 追踪 | ✅ 存储函数 | ✅ 存储函数 | ✅ **普通 INSERT** | ✅ 存储函数 |
+| RPO 检测 | ✅ | ✅ | ✅ | ✅ |
+| 定时巡检 | ✅ | ✅ | ✅ | ✅ |
+
+**sqlserver 模式的两点特别说明**：
+
+1. `app-db-setup` 不会创建 `sp_track_write`，而是打印一条等价的普通 INSERT
+   语句给 JMeter 使用——该模式下 Kingbase 不支持 plpgsql 函数体内的 INSERT。
+2. 该模式不返回运行时错误的详细信息（只给数字错误码）。工具会检测到失败
+   并报错，但错误原因需要结合数据库日志排查。
 
 ## 安装（内网环境可用）
 
@@ -14,10 +35,14 @@
 # 1. 在有网络的机器上下载依赖包
 pip download -d ./offline_pkgs -r requirements.txt \
     --platform manylinux2014_x86_64 \
-    --python-version 38 \
+    --python-version 311 \
     --only-binary=:all:
 
 # 2. 将整个 comparator 目录 + offline_pkgs 拷到内网机器
+
+#    离线包必须与目标机的 Python 版本和平台一致。本仓库 offline_pkgs/
+#    内是 cp311（Python 3.11）+ manylinux2014_x86_64 的 wheel。
+#    目标机版本不同时，用相同的 --python-version / --platform 重新下载。
 
 # 3. 在内网机器上离线安装
 pip install --no-index --find-links=./offline_pkgs -r requirements.txt
@@ -102,7 +127,7 @@ python cli.py -c config.yaml list-backends
 | 引擎 | 说明 | 来源 | 多节点 |
 |---|---|---|---|
 | `checksum`（默认） | 按主键区间分块算哈希，快；发现差异后会**自动定位到具体行** | 内置 | 支持 |
-| `native` | 全表逐行精确对比，适合小表深度排查 | 内置 | 支持 |
+| `native` | 全表逐行精确对比，适合小表深度排查 | 内置 | **不支持**（用 `-a/-b`） |
 | `pg_comparator` | 成熟的行级对比工具，可作独立交叉验证 | 外部，可选 | **不支持** |
 | `data_diff` | 支持**跨数据库类型**对比（如 Kingbase 对 MySQL） | 外部，可选 | **不支持** |
 
@@ -342,6 +367,19 @@ SELECT public.sp_track_write(
     p_request_id     -- 请求标识：一个 JMeter 请求填一个唯一值
 )
 ```
+
+**sqlserver 兼容模式的差异（重要）**：该模式下 Kingbase 不接受 plpgsql 函数体内的
+任何 INSERT，因此 `sp_track_write` 不会被创建。`app-db-setup` 会直接打印可用的
+普通 INSERT 模板：
+
+```sql
+INSERT INTO public._app_db_tracking
+    (batch_id, txn_id, request_id, operation, table_name, pk_values, row_data)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+```
+
+其余用法完全相同（同样放在业务 SQL 之后、同一事务内、最后统一提交）。
+其它三种模式仍然使用 `sp_track_write`，两者行为一致。
 
 ### 4.4 撕裂事务检测
 

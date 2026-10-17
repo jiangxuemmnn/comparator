@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import contextlib
+import logging
 import io
 import sys
 import os
@@ -104,8 +105,11 @@ def _print_result(result: dict, fmt: str = "table"):
     print("  Backend:      %s" % result.get("backend", "N/A"))
     print("  Tables checked: %s" % result.get("tables_checked", 0))
     print("  Tables diff:   %s" % result.get("tables_diff", 0))
+    if result.get("tables_inconclusive"):
+        print("  Inconclusive:  %s" % result.get("tables_inconclusive"))
     print("  Total time:    %ss" % result.get("total_time", "N/A"))
-    print("  Result:        %s" % ("PASS" if result.get("success") else "FAIL"))
+    print("  Result:        %s" % result.get(
+        "conclusion", "PASS" if result.get("success") else "FAIL"))
 
     # Diff details
     if result.get("tables_diff", 0) > 0 and "results" in result:
@@ -219,9 +223,14 @@ def _with_consistency(pool, config, args, nodes, base, tables, fn):
         except Exception:
             watch = []
 
+    mode = getattr(args, "consistency_mode", None)
+    watermark = getattr(args, "watermark", None)
+    if mode == "watermark" and not watermark:
+        print("警告: --consistency-mode watermark 需要同时提供 --watermark <值>；"
+              "未提供时水位线不生效，实际比较的是整表。", file=sys.stderr)
+
     session = ConsistencySession(
-        pool, config, nodes, base,
-        mode=getattr(args, "consistency_mode", None))
+        pool, config, nodes, base, mode=mode)
     if getattr(args, "wait_quiesce", None):
         session.quiesce_seconds = int(args.wait_quiesce)
     session.preflight(schema, watch)
@@ -316,25 +325,32 @@ def _print_multi_result(result: dict, fmt: str = "table"):
 
 
 def cmd_app_db_setup(args, config, pool):
-    """Create tracking table + stored function for JMeter integration.
-
-    After running this, JMeter can call:
-        SELECT public.sp_track_write('batch1', 'INSERT', 'accounts',
-                                      '{"id":123}', '{"id":123,"bal":100}')
-    """
+    """Create tracking table (and stored function where supported)."""
     logger = setup_logger(config)
     schema = args.schema or config["comparison"]["schema"]
-    setup_tracking(pool, args.node, schema)
-    print("Tracking infrastructure created on node '%s'" % args.node)
+    info = setup_tracking(pool, args.node, schema)
+    print("Tracking infrastructure created on node '%s' (mode: %s)"
+          % (args.node, info.get("mode") or "unknown"))
     print()
-    print("JMeter JDBC PostProcessor SQL:")
-    print("  SELECT %s.sp_track_write(" % schema)
-    print("      '${batchId}',")
-    print("      'INSERT',")
-    print("      '<table_name>',")
-    print("      '{\"<pk_col>\": ${<pk_var>}}',")
-    print("      '{\"<col1>\": ${<var1>}, ...}'")
-    print("  )")
+
+    if info.get("function"):
+        print("JMeter JDBC PostProcessor SQL:")
+        print("  SELECT %s.sp_track_write(" % schema)
+        print("      '${batchId}',")
+        print("      'INSERT',")
+        print("      '<table_name>',")
+        print("      '{\"<pk_col>\": ${<pk_var>}}',")
+        print("      '{\"<col1>\": ${<var1>}, ...}',")
+        print("      '${txnId}',")
+        print("      '${REQ_ID}'")
+        print("  )")
+    else:
+        print("该节点是 sqlserver 兼容模式：存储函数体内的 INSERT 不受支持，")
+        print("因此没有创建 sp_track_write。JMeter 请直接使用普通 INSERT")
+        print("（参数从左到右：batch_id, txn_id, request_id, operation,")
+        print("  table_name, pk_values, row_data）：")
+        print()
+        print("  " + " ".join(info["insert_sql"].split()))
     print()
     print("After JMeter finishes, verify with:")
     print("  python cli.py -c %s app-db-verify -n %s" % (args.config, args.node))
@@ -353,15 +369,30 @@ def cmd_app_db_verify(args, config, pool):
         mark_verified=not args.no_mark,
     )
 
+    if result.get("error"):
+        if args.format == "json":
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        else:
+            print("App-DB 校验未能完成: %s" % result["error"])
+        return 2
+
     if args.format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     else:
         print("\nApp-DB Consistency Verification:")
         print("  Total operations tracked: %d" % result["total"])
         print("  Verified OK:             %d" % result["verified"])
+        if result.get("superseded"):
+            print("  Superseded (older records):  %d" % result["superseded"])
         print("  Missing (data lost):     %d" % result["missing"])
         print("  Mismatch (wrong value):  %d" % result["mismatch"])
         print("  Result:  %s" % ("PASS" if result["success"] else "FAIL"))
+
+        if result.get("torn_transactions"):
+            print("\n  撕裂事务（同一事务的部分写操作落库、部分没有）:")
+            for t in result["torn_transactions"][:20]:
+                print("    txn=%s  %d/%d 成功  %s" % (
+                    t["txn_id"], t["ok_ops"], t["total_ops"], t["detail"]))
 
         if result["errors"]:
             print("\n  Error details (first 20):")
@@ -432,6 +463,8 @@ def cmd_jtl_reconcile(args, config, pool):
     else:
         print(jtl_format(result))
 
+    if result.get("error"):
+        return 2
     return 0 if result.get("success") else 1
 
 
@@ -462,6 +495,13 @@ def cmd_rpo_check(args, config, pool):
 
     rpo = RPOChecker(pool, args.node, schema, config=config)
     result = rpo.check_all(args.batch_id)
+
+    if result.get("error"):
+        if args.format == "json":
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        else:
+            print("RPO 检查未能完成: %s" % result["error"])
+        return 2
 
     if args.format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
@@ -1161,10 +1201,13 @@ def main():
 
         return cmd_func(args, config, pool)
     except Exception as e:
+        # An uncaught error means the command could not produce an answer;
+        # that is exit 2 ("inconclusive"), not 1 ("the data differs").
         print("Error: %s" % e, file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        return 1
+        if not isinstance(e, (ValueError, FileNotFoundError)):
+            import traceback
+            traceback.print_exc()
+        return 2
     finally:
         if pool:
             pool.close_all()

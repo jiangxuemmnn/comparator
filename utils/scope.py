@@ -107,28 +107,29 @@ class ScopeMatcher:
     def __init__(self, config: dict, default_database: str = None):
         self.default_database = default_database
         self.scopes = []
+        self._overrides = []
 
         for raw in (config.get("scopes") or []):
             if isinstance(raw, dict):
                 self.scopes.append(Scope(raw))
 
-        if not self.scopes:
-            # Legacy config: comparison.schema + comparison.exclude_tables
-            cmp_cfg = config.get("comparison", {}) or {}
-            self.scopes.append(Scope({
-                "include_schemas": [cmp_cfg.get("schema") or "public"],
-                "exclude_tables": _as_list(cmp_cfg.get("exclude_tables")),
-            }))
+        # The legacy rules are kept even when `scopes` is configured: they
+        # are the fallback for a database that no scope covers.
+        cmp_cfg = config.get("comparison", {}) or {}
+        self._legacy = Scope({
+            "include_schemas": [cmp_cfg.get("schema") or "public"],
+            "exclude_tables": _as_list(cmp_cfg.get("exclude_tables")),
+        })
 
     # -- CLI overrides -----------------------------------------------------
 
     def add_overrides(self, exclude_databases=None, exclude_schemas=None,
                       exclude_tables=None):
-        """Merge command-line exclusions as one extra scope.
+        """Add command-line exclusions on top of the configured rules.
 
-        The scope is added unconditionally (even when empty) only if it
-        actually excludes something, so a no-op CLI cannot accidentally
-        become an allow-list.
+        Kept in a separate list so they can only ever remove more objects.
+        Appending them to `self.scopes` would have made them count as
+        "configured scopes" and suppressed the legacy fallback below.
         """
         over = Scope({
             "exclude_databases": _as_list(exclude_databases),
@@ -136,23 +137,36 @@ class ScopeMatcher:
             "exclude_tables": _as_list(exclude_tables),
         })
         if over.exclude_databases or over.exclude_schemas or over.exclude_tables:
-            self.scopes.append(over)
+            self._overrides.append(over)
         return self
+
+    def _applicable(self, dbname: str):
+        """Scopes that govern this database.
+
+        When `scopes` is configured but none of them names this database,
+        falling through to "no restriction at all" opened up every schema on
+        the instance -- including Kingbase's internal `sys` schema and the
+        tool's own tracking tables. In that case the legacy
+        comparison.schema whitelist applies instead.
+        """
+        db = dbname or self.default_database or ""
+        base = [s for s in self.scopes if s.covers(db)]
+        if not base:
+            base = [self._legacy]
+        return base + [o for o in self._overrides if o.covers(db)]
 
     # -- queries -----------------------------------------------------------
 
     def database_allowed(self, dbname: str) -> bool:
         db = dbname or self.default_database or ""
-        for scope in self.scopes:
-            if scope.covers(db) and not scope.database_allowed(db):
+        for scope in self._applicable(db):
+            if not scope.database_allowed(db):
                 return False
         return True
 
     def schema_allowed(self, dbname: str, schema: str) -> bool:
         db = dbname or self.default_database or ""
-        for scope in self.scopes:
-            if not scope.covers(db):
-                continue
+        for scope in self._applicable(db):
             if not scope.database_allowed(db):
                 return False
             if not scope.schema_allowed(schema):
@@ -161,9 +175,7 @@ class ScopeMatcher:
 
     def table_allowed(self, dbname: str, schema: str, table: str) -> bool:
         db = dbname or self.default_database or ""
-        for scope in self.scopes:
-            if not scope.covers(db):
-                continue
+        for scope in self._applicable(db):
             if not scope.database_allowed(db):
                 return False
             if not scope.schema_allowed(schema):

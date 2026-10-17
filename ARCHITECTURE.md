@@ -199,14 +199,47 @@ O(n²/chunk_size)。
 专用连接，退出时回滚并关闭——既及时结束只读事务（长时间读事务会阻碍主库
 vacuum，也可能被备库的 `max_standby_streaming_delay` 中断），也避免相互干扰。
 
+#### 四模式兼容层
+
+工具不按模式名分支，而是**连接时探测** `SHOW database_mode`，只在 sqlserver
+模式下启用一组适配。四套集群实测结果（KingbaseES V009R001C010）：
+
+```
+               oracle   mysql   sqlserver   pg
+autocommit=False  ✓       ✓        ✗         ✓      ← sqlserver 拒绝裸 BEGIN
+命名游标           ✓       ✓        ✗         ✓      ← psycopg2 按 autocommit 判断
+运行时错误抛出      ✓       ✓        ✗         ✓      ← 最危险：失败被当成零行
+TIMESTAMP 默认值    ✓       ✓        ✗         ✓      ← T-SQL 的 TIMESTAMP 是 rowversion
+|| 拼接            ✓       ✓        ✗         ✓
+ALTER ADD COLUMN   ✓       ✓        ✗         ✓
+plpgsql 内 INSERT   ✓       ✓        ✗         ✓      ← 追踪函数在该模式不可用
+= ANY(array)       ✓       ✓        ✗         ✓
+```
+
+对应的实现集中在 `utils/db.py`（模式探测、autocommit、`_HoldCursor`、
+`_check_statement`、`timestamp_type`）与三个 DDL 构造点
+（`workload/generator.py`、`core/app_db_comparator.py`、`core/rpo_checker.py`）。
+
+**最能说明问题的一条**是"运行时错误不抛异常"：在 sqlserver 模式下，
+查询一张不存在的表会正常返回、`description` 为空、`statusmessage` 为空，
+`fetchall()` 却抛 `no results to fetch`。若不处理，一次失败的查询会被当成
+"零行"参与比较。`_check_statement` 把空的 `statusmessage` 当作失败标志
+（所有成功语句——含 DDL、DML、游标命令——都有非空 status），并用
+`SELECT @@ERROR` 取出数字错误码。错误文本该模式不提供。
+
+另外，sqlserver 模式下 **plpgsql 函数体内的任何 INSERT 都失败**（`PERFORM`
+可以），所以 `sp_track_write` 在该模式不创建，`app-db-setup` 改为打印普通
+INSERT 模板；其余三种模式仍使用存储函数，两者语义一致。
+
 ### 5. Workload 负载模块 — `workload/`
 
 `generator.py` 生成测试数据；`runner.py` 解析 YAML 模板并多线程执行。
 
 > `runner.py` 的多线程共享同一个数据库连接，是已知限制，不适合高并发场景。
 
-**Python 3.8 兼容性**：所有使用 PEP 585 类型标注（如 `list[str]`）的模块均
-添加了 `from __future__ import annotations`。
+**Python 版本**：目标运行环境为 Python 3.11。代码中仍保留了
+`from __future__ import annotations`（PEP 585 标注在 3.8 上需要它），在 3.11
+下无害，保留是为了不引入无谓改动。
 
 ---
 

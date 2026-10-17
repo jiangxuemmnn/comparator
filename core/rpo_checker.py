@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS {schema}._rpo_markers (
     table_name VARCHAR(256),
     phase VARCHAR(32) NOT NULL,  -- 'before_fault', 'after_fault'
     extra JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at {ts} DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS {schema}._rpo_snapshots (
     table_name VARCHAR(256) NOT NULL,
     row_count BIGINT NOT NULL,
     max_id BIGINT,
-    snapshot_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    snapshot_at {ts} DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -96,8 +96,10 @@ class RPOChecker:
     def _ensure_tables(self):
         """Create RPO tracking tables if not exist."""
         pool = self.pool
-        pool.execute_ddl(self.node, CREATE_MARKER_TABLE.format(schema=self.schema))
-        pool.execute_ddl(self.node, CREATE_SNAPSHOT_TABLE.format(schema=self.schema))
+        pool.execute_ddl(self.node, CREATE_MARKER_TABLE.format(
+            schema=self.schema, ts=pool.timestamp_type(self.node)))
+        pool.execute_ddl(self.node, CREATE_SNAPSHOT_TABLE.format(
+            schema=self.schema, ts=pool.timestamp_type(self.node)))
 
     def plant_markers(self, tables: list = None,
                       marker_count: int = 10) -> str:
@@ -125,20 +127,41 @@ class RPOChecker:
         for table in tables:
             count = self.pool.get_row_count(self.node, self.schema, table)
 
+            # MAX(pk) is stored in a BIGINT column (`max_id`), so it is only
+            # meaningful for integer keys. A varchar or uuid key makes that
+            # INSERT fail outright ("invalid input syntax for type bigint"),
+            # which aborted the whole plant and left a half-written snapshot.
+            # Such tables simply skip the max-key regression check; the row
+            # count still covers them.
             max_id = None
             pk_cols = self.pool.get_primary_key(self.node, self.schema, table)
             if pk_cols and len(pk_cols) == 1:
+                pk_type = ""
                 try:
-                    rows = self.pool.execute(
-                        self.node,
-                        "SELECT MAX(%s) FROM %s.%s" % (
-                            _quote_ident(pk_cols[0]),
-                            _quote_ident(self.schema),
-                            _quote_ident(table)),
-                    )
-                    max_id = rows[0][0] if rows else None
+                    for col in self.pool.get_column_info(
+                            self.node, self.schema, table):
+                        if col["name"] == pk_cols[0]:
+                            pk_type = (col.get("type") or "").lower()
+                            break
                 except Exception:
                     pass
+                if any(t in pk_type for t in ("int", "serial", "number")):
+                    try:
+                        rows = self.pool.execute(
+                            self.node,
+                            "SELECT MAX(%s) FROM %s.%s" % (
+                                _quote_ident(pk_cols[0]),
+                                _quote_ident(self.schema),
+                                _quote_ident(table)),
+                        )
+                        value = rows[0][0] if rows else None
+                        # NUMERIC can carry a fraction; only a plain int can
+                        # be stored as BIGINT without loss.
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            max_id = value
+                    except Exception as e:
+                        logger.debug("MAX(%s) unavailable on %s.%s: %s",
+                                     pk_cols[0], self.schema, table, e)
 
             self.pool.execute(
                 self.node,
@@ -160,7 +183,11 @@ class RPOChecker:
             self.node,
             "INSERT INTO %s._rpo_markers "
             "(marker_id, batch_id, table_name, phase, extra) "
-            "SELECT %%s || '_' || g, %%s, '(replication-probe)', 'before_fault', "
+            # concat() rather than `||`: the sqlserver compatibility mode
+            # does not accept `||` at all, and no single operator works in
+            # all four modes (`+` fails in oracle/pg). Two-argument concat,
+            # nested, is understood everywhere.
+            "SELECT concat(concat(%%s, '_'), g), %%s, '(replication-probe)', 'before_fault', "
             "       json_build_object('seq', g, 'total', %%s, "
             "                         'timestamp', %%s)::jsonb "
             "FROM generate_series(1, %%s) g" % self.schema,
@@ -336,9 +363,46 @@ class RPOChecker:
                      "唯一可靠的区分手段是应用侧记录（app-db 追踪模式）。"),
         }
 
+    def batch_exists(self, batch_id: str) -> bool:
+        """True if this batch left any snapshot or marker behind."""
+        for table in ("_rpo_snapshots", "_rpo_markers"):
+            try:
+                rows = self.pool.execute(
+                    self.node,
+                    "SELECT COUNT(*) FROM %s.%s WHERE batch_id = %%s"
+                    % (_quote_ident(self.schema), _quote_ident(table)),
+                    (batch_id,),
+                )
+                if rows and rows[0][0] > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def check_all(self, batch_id: str) -> dict:
         """Run the full RPO assessment: markers + count/key conservation."""
         logger.info("Running full RPO check (batch=%s) ...", batch_id)
+
+        # A batch id that was never planted (a typo, or a plant that failed)
+        # must not roll up to "PASS - no data loss": no evidence is not the
+        # same as no loss, and that is the most dangerous way to be wrong
+        # about an RPO result.
+        if not self.batch_exists(batch_id):
+            return {
+                "batch_id": batch_id,
+                "node": self.node,
+                "rpo_success": False,
+                "data_loss_detected": None,
+                "error": ("批次 '%s' 在节点 %s 上不存在（没有对应的快照或探针）。"
+                          "请确认 batch_id 是否正确，或重新执行 rpo-plant。"
+                          % (batch_id, self.node)),
+                "markers": {"total": 0, "found": 0, "missing": 0,
+                            "missing_details": [], "success": False},
+                "conservation": {"tables_checked": 0, "tables_with_loss": 0,
+                                 "success": False, "details": [], "losses": []},
+                "summary": {"markers_lost": 0, "tables_with_loss": 0,
+                            "rows_lost": 0},
+            }
 
         markers = self.check_markers(batch_id)
         conservation = self.check_conservation(batch_id)

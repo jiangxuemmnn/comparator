@@ -29,6 +29,68 @@ class TableNotFound(Exception):
     """Raised when a requested table cannot be resolved on a node."""
 
 
+class _HoldCursor:
+    """Iterate a `DECLARE ... WITH HOLD` cursor in batches.
+
+    Exists for Kingbase's sqlserver compatibility mode, where psycopg2's
+    named cursors cannot be used: psycopg2 decides whether a named cursor is
+    allowed from `conn.autocommit`, and that mode requires autocommit to be
+    True. A WITH HOLD cursor is declared explicitly, committed (which
+    materialises it), and then fetched in batches -- the same streaming
+    behaviour without a psycopg2-managed transaction.
+
+    It exposes just enough of the cursor interface for callers that do
+    `for row in cur`: iteration, and close().
+    """
+
+    def __init__(self, conn, cursor_name: str, itersize: int = 5000):
+        self._conn = conn
+        self._name = cursor_name
+        self._itersize = max(1, int(itersize or 5000))
+        self._exhausted = False
+
+    def __iter__(self):
+        quoted = quote_ident(self._name)
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        try:
+            while not self._exhausted:
+                cur.execute("FETCH FORWARD %d FROM %s"
+                            % (self._itersize, quoted))
+                if not cur.description:
+                    # A FETCH that fails is swallowed in sqlserver mode.
+                    # Without this check it would look exactly like reaching
+                    # the end of the result, silently truncating the scan.
+                    code = None
+                    try:
+                        with self._conn.cursor() as probe:
+                            probe.execute("SELECT @@ERROR")
+                            row = probe.fetchone()
+                            code = row[0] if row else None
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "FETCH 失败（sqlserver 模式未返回错误信息，@@ERROR=%s）"
+                        % code)
+                rows = cur.fetchall()
+                if not rows:
+                    self._exhausted = True
+                    break
+                for row in rows:
+                    yield row
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("CLOSE %s" % quote_ident(self._name))
+        except Exception:
+            pass
+
+
 class DatabasePool:
     """Simple connection pool for multiple database nodes."""
 
@@ -36,6 +98,85 @@ class DatabasePool:
         self._config = config
         self._conns: dict[str, psycopg2.extensions.connection] = {}
         self._table_cache: dict[tuple, str] = {}
+        # Kingbase compatibility mode per node ("oracle"/"mysql"/"sqlserver"/
+        # "pg"). Determined once per node on first connect.
+        self._mode_cache: dict[str, str] = {}
+
+    def _detect_mode(self, name: str, conn) -> str:
+        """Return the node's `database_mode`, caching it.
+
+        The mode decides whether the connection may run in transaction mode
+        at all: the sqlserver compatibility mode rejects the bare `BEGIN`
+        that psycopg2 emits when `autocommit` is off, so every statement --
+        including the very first SELECT -- fails with
+        `syntax error at end of input`.
+
+        Detection runs with autocommit on (a statement must be allowed to
+        execute before we know the answer) and the caller sets the final
+        autocommit value afterwards. A failed probe leaves the mode empty,
+        which keeps the previous behaviour (transaction mode).
+        """
+        if name in self._mode_cache:
+            return self._mode_cache[name]
+
+        mode = ""
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SHOW database_mode")
+                row = cur.fetchone()
+                mode = (row[0] if row else "") or ""
+        except Exception as e:
+            logger.debug("Could not detect database_mode on %s: %s", name, e)
+        mode = str(mode).strip().lower()
+        self._mode_cache[name] = mode
+        return mode
+
+    def is_sqlserver(self, name: str) -> bool:
+        """True when this node runs Kingbase's sqlserver compatibility mode."""
+        self.get_conn(name)
+        return self._mode_cache.get(name) == "sqlserver"
+
+    def timestamp_type(self, name: str) -> str:
+        """SQL type to use for a timestamp column on this node.
+
+        In T-SQL `TIMESTAMP` is a rowversion (a binary concurrency token),
+        so `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` is rejected. `DATETIME` is
+        the datetime type there and accepts the same default. Every other
+        mode uses the standard `TIMESTAMP`.
+        """
+        return "DATETIME" if self.is_sqlserver(name) else "TIMESTAMP"
+
+    def _check_statement(self, name: str, cur, sql: str = ""):
+        """Raise if a statement silently failed on a sqlserver-mode node.
+
+        In sqlserver compatibility mode, Kingbase raises parse errors
+        normally but swallows execution-time failures: a query against a
+        missing table, a division by zero or a unique violation returns no
+        rows, no command tag and no exception. Silently treating those as
+        "zero rows" would let the comparison report consistency from a
+        query that never ran.
+
+        The only trace left is an empty `statusmessage` -- every successful
+        statement (including DDL, DML and cursor commands) sets one. `@@ERROR`
+        yields a numeric SQLCODE, but the message text is not exposed.
+        """
+        if self._mode_cache.get(name) != "sqlserver":
+            return
+        if cur.statusmessage:
+            return
+
+        code = None
+        try:
+            with cur.connection.cursor() as probe:
+                probe.execute("SELECT @@ERROR")
+                row = probe.fetchone()
+                code = row[0] if row else None
+        except Exception:
+            pass
+        raise RuntimeError(
+            "SQL 执行失败，但 Kingbase 的 sqlserver 兼容模式未返回错误信息"
+            "（@@ERROR=%s）: %s" % (code, " ".join((sql or "").split())[:200]))
 
     def get_conn(self, name: str):
         """Get or create a connection to a named database node."""
@@ -49,7 +190,13 @@ class DatabasePool:
                 password=dbcfg.get("password", ""),
                 connect_timeout=dbcfg.get("connect_timeout", 10),
             )
-            conn.autocommit = False
+            mode = self._detect_mode(name, conn)
+            # sqlserver mode: no implicit BEGIN, so every statement runs and
+            # commits on its own. Reads are unaffected; writes already used
+            # autocommit before this change.
+            conn.autocommit = (mode == "sqlserver")
+            if mode == "sqlserver":
+                logger.debug("Node %s runs in sqlserver mode; using autocommit", name)
             self._conns[name] = conn
         return self._conns[name]
 
@@ -79,23 +226,49 @@ class DatabasePool:
                 cur.executemany(sql, params)
             else:
                 cur.execute(sql, params)
+            self._check_statement(name, cur, sql)
             if fetch:
-                return cur.fetchall()
+                rows = cur.fetchall()
+                # End the read transaction. Without this the connection sits
+                # "idle in transaction" between reads, which holds back
+                # vacuum on the primary and keeps a snapshot alive on a
+                # standby. The statement was a read, so rolling back loses
+                # nothing.
+                try:
+                    self.get_conn(name).rollback()
+                except Exception:
+                    pass
+                return rows
             return None
 
     def execute_ddl(self, name: str, sql: str):
-        """Execute DDL, auto-committed."""
+        """Execute DDL, auto-committed.
+
+        psycopg2 refuses to change `autocommit` while a transaction is open
+        ("set_session cannot be used inside a transaction"), so any read
+        transaction left by an earlier statement is ended first. The original
+        autocommit value is restored rather than hard-coding False -- on a
+        sqlserver-mode node it starts as True, and forcing it back to False
+        would break every statement that follows.
+        """
         conn = self.get_conn(name)
+        previous = conn.autocommit
+        if not previous:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         conn.autocommit = True
         try:
             with conn.cursor() as cur:
                 cur.execute(sql)
+                self._check_statement(name, cur, sql)
         finally:
-            conn.autocommit = False
+            conn.autocommit = previous
 
     @contextmanager
     def stream_cursor(self, name: str, sql: str, params=None, itersize: int = 5000):
-        """Server-side (named) cursor for streaming a large result set.
+        """Server-side cursor for streaming a large result set.
 
         `execute()` always calls fetchall(), which materialises the whole
         result in memory. Comparing large tables needs rows to arrive in
@@ -107,11 +280,17 @@ class DatabasePool:
         transaction out from under them. Table comparisons run in parallel,
         so that collision is the normal case, not an edge case.
 
-        The connection is opened with autocommit off (a named cursor cannot
-        exist without a transaction) and rolled back on exit, which both ends
-        the read promptly and keeps the transaction short -- important
-        because a long read transaction holds back vacuum on the primary and
-        can be cancelled by `max_standby_streaming_delay` on a standby.
+        Two implementations, chosen by compatibility mode:
+
+        * normal modes -- psycopg2's named cursor, inside a transaction that
+          is rolled back on exit so the read ends promptly (a long read
+          transaction holds back vacuum on the primary and can be cancelled
+          by `max_standby_streaming_delay` on a standby);
+
+        * sqlserver mode -- psycopg2 refuses named cursors there because it
+          keys off `conn.autocommit`, which must be True in that mode. A
+          `DECLARE ... WITH HOLD` cursor gives the same batched, server-side
+          iteration without needing a psycopg2-managed transaction.
         """
         dbcfg = self._config["databases"][name]
         conn = psycopg2.connect(
@@ -122,6 +301,37 @@ class DatabasePool:
             password=dbcfg.get("password", ""),
             connect_timeout=dbcfg.get("connect_timeout", 10),
         )
+
+        mode = self._mode_cache.get(name)
+        if mode is None:
+            mode = self._detect_mode(name, conn)
+
+        if mode == "sqlserver":
+            # The dedicated connection is new, so its autocommit still has
+            # psycopg2's default of False -- the mode cache only tells us
+            # what this node needs, it does not apply the setting. Without
+            # this the DECLARE below triggers the same implicit BEGIN that
+            # sqlserver mode rejects.
+            conn.autocommit = True
+            cursor_name = "cmp_%s" % uuid.uuid4().hex[:12]
+            holder = _HoldCursor(conn, cursor_name, itersize)
+            try:
+                with conn.cursor() as q:
+                    declare_sql = ("DECLARE %s CURSOR WITH HOLD FOR %s"
+                                   % (quote_ident(cursor_name), sql))
+                    q.execute(declare_sql, params)
+                    self._check_statement(name, q, declare_sql)
+                    q.execute("COMMIT")
+                    self._check_statement(name, q, "COMMIT")
+                yield holder
+            finally:
+                holder.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return
+
         conn.autocommit = False
         cur = None
         try:
